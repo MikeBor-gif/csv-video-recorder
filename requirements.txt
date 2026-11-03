@@ -1,1 +1,2 @@
+--prefer-binary
 playwright>=1.51

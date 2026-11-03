@@ -84,6 +84,7 @@ path = qscript.CaptureVideo_Magento(
 
 | Симптом | Решение |
 |---------|---------|
+| `Failed to build installable wheels ... greenlet` при `pip install` | Устаревший pip или файл без строки `--prefer-binary`: обновите pip (`python -m pip install -U pip`) и используйте `requirements.txt` из репозитория — он выбирает версии с готовыми wheel |
 | `Executable doesn't exist ... chromium` | Выполните `python -m playwright install chromium` |
 | `FAILED: <company>` и `results did not appear` | DuckDuckGo показал капчу или медленно отрисовывает выдачу: повторите запуск, оставьте `HEADLESS = False`, увеличьте `RESULTS_TIMEOUT_MS` |
 | Ошибка вида `filter() got an unexpected keyword argument 'visible'` | Обновите Playwright: `pip install -U "playwright>=1.51"` |
@@ -96,5 +97,5 @@ path = qscript.CaptureVideo_Magento(
 |------|------------|
 | `capture_video.py` | Точка входа: читает CSV через `csv.DictReader(f, delimiter=";", quotechar='"')` и вызывает сценарий для каждой строки |
 | `qscript.py` | `PATH_TO_VIDEO_FOLDER`, `CaptureVideo_Magento`, `ShowCallout`, JS-оверлеи курсора |
-| `requirements.txt` | `playwright>=1.51` |
+| `requirements.txt` | `playwright>=1.51` (с `--prefer-binary` для установки на Python 3.9 без компилятора) |
 | `input.csv` | Пример входных данных |
