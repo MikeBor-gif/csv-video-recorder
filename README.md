@@ -40,7 +40,7 @@ Done: 2/2 videos saved
 
 ## Формат входного CSV
 
-UTF-8, разделитель `;`, кавычки `"`. Заголовок обязателен и должен совпадать точно:
+UTF-8 (BOM, который добавляет Excel, допускается), разделитель `;`, кавычки `"`. Заголовок обязателен и должен совпадать точно:
 
 ```text
 URL;Company Name;Language;Country;Postcode;City;Street;HouseNo
@@ -84,7 +84,10 @@ path = qscript.CaptureVideo_Magento(
 
 | Симптом | Решение |
 |---------|---------|
-| `Failed to build installable wheels ... greenlet` при `pip install` | Устаревший pip или файл без строки `--prefer-binary`: обновите pip (`python -m pip install -U pip`) и используйте `requirements.txt` из репозитория — он выбирает версии с готовыми wheel |
+| `Failed to build installable wheels ... greenlet` при `pip install` | У свежей версии `greenlet` нет готового wheel для вашей версии Python, а компилятора C++ нет. Используйте `requirements.txt` из репозитория (в нём `--prefer-binary`) или выполните `pip install --prefer-binary -r requirements.txt` |
+| `[ERROR] CSV header must be: ...` | Заголовок CSV должен совпадать точно: `URL;Company Name;Language;Country;Postcode;City;Street;HouseNo`, разделитель `;` |
+| `[ERROR] cannot write ... PermissionError` | Видео с тем же именем открыто в плеере — закройте его и запустите снова |
+| `[WARN] row N overwrote the video of row M` | В CSV повторяется `Company Name`: видео сохраняется как `<Company Name>.webm`, поэтому последняя строка перезаписывает предыдущую |
 | `Executable doesn't exist ... chromium` | Выполните `python -m playwright install chromium` |
 | `FAILED: <company>` и `results did not appear` | DuckDuckGo показал капчу или медленно отрисовывает выдачу: повторите запуск, оставьте `HEADLESS = False`, увеличьте `RESULTS_TIMEOUT_MS` |
 | Ошибка вида `filter() got an unexpected keyword argument 'visible'` | Обновите Playwright: `pip install -U "playwright>=1.51"` |

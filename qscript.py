@@ -298,12 +298,24 @@ def _finalize_video(video, video_dir, company_name, succeeded):
         except PlaywrightError as exc:
             _log(company_name or "unnamed", f"[FIX] no video to delete: {exc}", "DEBUG")
         return None
+    company = company_name or "unnamed"
     target = video_dir / f"{_safe_filename(company_name)}.webm"
-    if target.exists():
-        target.unlink()
-    video.save_as(str(target))
-    video.delete()
-    _log(company_name or "unnamed", f"saved: {target}")
+    _log(company, f"[FIX] finalizing video -> {target}", "DEBUG")
+    try:
+        if target.exists():
+            target.unlink()
+        video.save_as(str(target))
+    except OSError as exc:
+        # E.g. the previous video is open in a player (Windows locks it) or the name is too long.
+        _log(company, f"cannot write {target}: {type(exc).__name__}: {exc}", "ERROR")
+        return None
+    finally:
+        # Always remove Playwright's raw recording (random hash name) from the video folder.
+        try:
+            video.delete()
+        except PlaywrightError as exc:
+            _log(company, f"[FIX] raw recording not deleted: {exc}", "WARN")
+    _log(company, f"saved: {target}")
     return str(target)
 
 
