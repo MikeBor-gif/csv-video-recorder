@@ -9,7 +9,7 @@ Python + Playwright (sync API, Chromium). Для каждой строки `inpu
 Требуется Python 3.9+ и доступ в интернет. Сторонних зависимостей, кроме `playwright`, нет.
 
 ```bash
-git clone <URL репозитория> csv-video-recorder
+git clone https://github.com/MikeBor-gif/csv-video-recorder.git
 cd csv-video-recorder
 
 python -m venv .venv
