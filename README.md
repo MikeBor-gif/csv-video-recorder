@@ -6,13 +6,23 @@ Python + Playwright (sync API, Chromium). Для каждой строки `inpu
 
 ## Быстрый старт
 
+Требуется Python 3.9+ и доступ в интернет. Сторонних зависимостей, кроме `playwright`, нет.
+
 ```bash
+git clone <URL репозитория> csv-video-recorder
+cd csv-video-recorder
+
+python -m venv .venv
+.venv\Scripts\activate              # Windows (PowerShell / cmd)
+# source .venv/bin/activate         # Linux / macOS
+
 pip install -r requirements.txt
 python -m playwright install chromium
-python capture_video.py            # или: python capture_video.py path/to/other.csv
+
+python capture_video.py             # или: python capture_video.py path/to/other.csv
 ```
 
-Требуется Python 3.9+. Сторонних зависимостей, кроме `playwright`, нет.
+Откроется окно Chromium, сценарий выполнится для каждой строки `input.csv` (~20 c на строку). Готовые видео — в папке `video/`.
 
 ## Возможности
 

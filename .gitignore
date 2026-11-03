@@ -4,3 +4,6 @@ video/
 # Python
 __pycache__/
 *.py[cod]
+
+# Virtual environment
+.venv/
