@@ -334,15 +334,19 @@ def _finalize_video(video, video_dir, company_name, succeeded):
 
 
 def ShowCallout(text, bgColor="#FFFF00", textColor="#000000", fade=True, page=None):
-    """Show a yellow (by default) text callout; fade-in/out takes about 2 s each."""
+    """Show a yellow (by default) text callout; fade-in/out takes about 2 s each.
+
+    Returns at once: the callout plays over the next actions, so the video has no idle start.
+    """
     target = page if page is not None else _active_page
     if target is None:
         _log("callout", "no active page, callout skipped", "WARN")
         return
     _log("callout", f'show: "{text}" fade={fade}')
     try:
+        # The wrapper does not return the callout's promise, so evaluate() does not wait for it.
         target.evaluate(
-            CALLOUT_JS,
+            f"(args) => {{ ({CALLOUT_JS})(args); }}",
             {"text": text, "bgColor": bgColor, "textColor": textColor, "fade": bool(fade), "holdMs": 1500},
         )
     except PlaywrightError as exc:
@@ -392,8 +396,9 @@ def CaptureVideo_Magento(
                 query = f"Magento developer in {city}"
 
                 _open_page(page, company, url)
-                # As in the reference video: the cursor waits in the top-left corner during the callout.
+                # The callout plays while the cursor already moves to the search box and types.
                 ShowCallout(query, "#FFFF00", "#000000", True)
+                _log(company, "[FIX] callout started without waiting for it", "DEBUG")
                 cursor.click_locator(page.locator(SEARCH_BOX), "search box")
                 _type_humanlike(page, company, query)
                 _submit_search(page, cursor)

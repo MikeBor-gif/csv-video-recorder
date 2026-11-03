@@ -22,7 +22,7 @@ python -m playwright install chromium
 python capture_video.py             # или: python capture_video.py path/to/other.csv
 ```
 
-Откроется окно Chromium, сценарий выполнится для каждой строки `input.csv` (~20 c на строку). Готовые видео — в папке `video/`.
+Откроется окно Chromium, сценарий выполнится для каждой строки `input.csv` (~17 c на строку). Готовые видео — в папке `video/`.
 
 ## Возможности
 
@@ -88,7 +88,7 @@ path = qscript.CaptureVideo_Magento(
 ```
 
 - `CaptureVideo_Magento(url, company_name, language, country, postcode, city, street, house_no)` — запускает сценарий и возвращает абсолютный путь к видео или `None` при ошибке. Исключения наружу не пробрасываются.
-- `ShowCallout(text, bgColor="#FFFF00", textColor="#000000", fade=True, page=None)` — показывает плашку с текстом. Без `page` использует страницу текущего сценария, поэтому вызывается изнутри `CaptureVideo_Magento`.
+- `ShowCallout(text, bgColor="#FFFF00", textColor="#000000", fade=True, page=None)` — показывает плашку с текстом и сразу возвращает управление: плашка проигрывается, пока сценарий продолжает действия. Без `page` использует страницу текущего сценария, поэтому вызывается изнутри `CaptureVideo_Magento`.
 
 ## Структура
 
