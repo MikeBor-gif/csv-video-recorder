@@ -31,6 +31,8 @@ HEADLESS = False
 
 SEARCH_BOX = 'textarea[name="q"]'
 SEARCH_BUTTON = 'form button[type="submit"]'
+# The visible magnifier in the search field ("Search" chip of the Search / Duck.ai toggle).
+SEARCH_ICON = '[data-testid="ai-toggle"] [role="radio"]'
 FIRST_RESULT = 'a[data-testid="result-title-a"]'
 
 NAV_TIMEOUT_MS = 30000
@@ -239,11 +241,18 @@ def _open_page(page, company, url):
 
 
 def _submit_search(page, cursor):
-    # The submit button inside the search field is collapsed (zero width);
-    # after typing, a visible "Search" button appears in the suggestions dropdown.
-    button = page.locator(SEARCH_BUTTON).filter(visible=True).first
+    # SEARCH_BUTTON is collapsed (zero width, opacity 0), so the mouse cannot hit it.
+    # Like in the reference video, the cursor clicks the magnifier next to it (the already selected
+    # "Search" mode, so the click changes nothing) and the form is submitted through
+    # SEARCH_BUTTON with element.click().
     try:
-        cursor.click_locator(button, "search button")
+        icon = page.locator(SEARCH_ICON).first
+        if icon.count():
+            cursor.click_locator(icon, "search icon")
+            page.locator(SEARCH_BUTTON).first.evaluate("button => button.click()")
+        else:
+            _log(cursor.company, "search icon not found, clicking the visible search button", "WARN")
+            cursor.click_locator(page.locator(SEARCH_BUTTON).filter(visible=True).first, "search button")
     except PlaywrightError as exc:
         if not _is_navigation_error(exc):
             raise
@@ -383,7 +392,7 @@ def CaptureVideo_Magento(
                 query = f"Magento developer in {city}"
 
                 _open_page(page, company, url)
-                cursor.move_to(VIDEO_SIZE["width"] / 2, VIDEO_SIZE["height"] / 3)
+                # As in the reference video: the cursor waits in the top-left corner during the callout.
                 ShowCallout(query, "#FFFF00", "#000000", True)
                 cursor.click_locator(page.locator(SEARCH_BOX), "search box")
                 _type_humanlike(page, company, query)
