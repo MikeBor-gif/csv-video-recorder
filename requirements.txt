@@ -1,2 +1,4 @@
 --prefer-binary
 playwright>=1.51
+flask>=2.2
+requests>=2.28
