@@ -15,15 +15,25 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 import requests  # noqa: E402
-from werkzeug.serving import make_server  # noqa: E402
 
 import video_client  # noqa: E402
 import web_service  # noqa: E402
+
+
+class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+
+
+class _QuietHandler(WSGIRequestHandler):
+    def log_message(self, *args):
+        pass
 
 
 def _free_port():
@@ -40,7 +50,8 @@ class VideoClientTestCase(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp(prefix="video_client_test_"))
         app = web_service.create_app(db_path=cls.tmp / "videos.db",
                                      upload_dir=cls.tmp / "uploads")
-        cls.server = make_server("127.0.0.1", 0, app, threaded=True)
+        cls.server = make_server("127.0.0.1", 0, app, server_class=_ThreadingWSGIServer,
+                                 handler_class=_QuietHandler)
         cls.server_url = f"http://127.0.0.1:{cls.server.server_port}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()

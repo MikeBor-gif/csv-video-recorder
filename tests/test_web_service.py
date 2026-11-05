@@ -113,6 +113,22 @@ class WebServiceTestCase(unittest.TestCase):
         self.assertFalse((self.upload_dir / "ACME_GmbH.webm").exists())
         self.assertEqual(self.query("SELECT COUNT(*) FROM videos")[0][0], 1)
 
+    def test_names_differing_only_in_case_get_separate_files(self):
+        first = self.upload("ACME", b"upper").json["video_url"]
+        second = self.upload("acme", b"lower").json["video_url"]
+        self.assertNotEqual(first.lower(), second.lower())
+        for url, expected in ((first, b"upper"), (second, b"lower")):
+            response = self.client.get(url)
+            self.assertEqual(response.data, expected)
+            response.close()
+
+    def test_unsafe_characters_are_removed_from_file_name(self):
+        cases = {"A\\B": "A_B", "Müller & Söhne": "Muller__Sohne", "../etc": "etc", "CON": "_CON"}
+        for company, stem in cases.items():
+            with self.subTest(company):
+                url = self.upload(company).json["video_url"]
+                self.assertTrue(url.endswith(f"/media/{stem}.webm"), url)
+
     def test_non_ascii_company_name_gets_hashed_file_name(self):
         response = self.upload("ООО Ромашка")
         self.assertEqual(response.status_code, 200)

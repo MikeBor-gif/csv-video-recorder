@@ -23,16 +23,16 @@ import hashlib
 import logging
 import mimetypes
 import os
+import re
 import sqlite3
 import sys
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import quote
 
 from flask import Flask, current_app, g, jsonify, request, send_from_directory
-from werkzeug.exceptions import HTTPException
-from werkzeug.utils import secure_filename
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -48,6 +48,15 @@ DEFAULT_MAX_UPLOAD_MB = 512
 
 ALLOWED_EXTENSIONS = {".webm", ".mp4", ".ogg", ".mov"}
 DEFAULT_EXTENSION = ".webm"
+
+# Status codes answered with a JSON body instead of Flask's HTML error page.
+JSON_ERROR_CODES = (400, 404, 405, 413, 500)
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 # SQLite waits this long for a competing writer before "database is locked".
 DB_TIMEOUT_SECONDS = 10
@@ -130,8 +139,7 @@ def upsert_video(db, company_name, file_path, video_url):
     logger.debug("DB upsert company=%r file_path=%r", company_name, file_path)
 
 
-def find_video(db, company_name):
-    # type: (sqlite3.Connection, str) -> Optional[sqlite3.Row]
+def find_video(db: sqlite3.Connection, company_name: str) -> Optional[sqlite3.Row]:
     row = db.execute(
         "SELECT * FROM videos WHERE company_name = ?", (company_name,)
     ).fetchone()
@@ -139,8 +147,7 @@ def find_video(db, company_name):
     return row
 
 
-def list_videos(db):
-    # type: (sqlite3.Connection) -> List[dict]
+def list_videos(db: sqlite3.Connection) -> List[dict]:
     rows = db.execute(
         "SELECT company_name, file_path, video_url, created_at, updated_at "
         "FROM videos ORDER BY updated_at DESC, id DESC"
@@ -148,10 +155,10 @@ def list_videos(db):
     return [dict(row) for row in rows]
 
 
-def _owner_of_file(db, file_path):
-    # type: (sqlite3.Connection, str) -> Optional[str]
+def _owner_of_file(db: sqlite3.Connection, file_path: str) -> Optional[str]:
+    # NOCASE: on Windows/macOS "ACME.webm" and "acme.webm" are the same file.
     row = db.execute(
-        "SELECT company_name FROM videos WHERE file_path = ?", (file_path,)
+        "SELECT company_name FROM videos WHERE file_path = ? COLLATE NOCASE", (file_path,)
     ).fetchone()
     return row["company_name"] if row else None
 
@@ -159,6 +166,17 @@ def _owner_of_file(db, file_path):
 # ---------------------------------------------------------------------------
 # Upload helpers
 # ---------------------------------------------------------------------------
+
+
+def _safe_name(name: str) -> str:
+    """ASCII-only, filesystem-safe file stem: "ACME GmbH" -> "ACME_GmbH"; may return ""."""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    ascii_name = re.sub(r"[\\/]", " ", ascii_name)
+    ascii_name = "_".join(ascii_name.split())
+    ascii_name = re.sub(r"[^A-Za-z0-9_.-]", "", ascii_name).strip("._")
+    if ascii_name.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+        ascii_name = f"_{ascii_name}"
+    return ascii_name
 
 
 def _name_hash(company_name):
@@ -171,7 +189,7 @@ def _storage_filename(db, upload_dir, company_name, extension):
     "ACME GmbH" -> "ACME_GmbH.webm"; names that sanitise to nothing (e.g. Cyrillic)
     or collide with another company's file get a short hash of the name appended.
     """
-    base = secure_filename(company_name)
+    base = _safe_name(company_name)
     if not base:
         return f"video_{_name_hash(company_name)}{extension}"
     filename = f"{base}{extension}"
@@ -281,15 +299,16 @@ def videos():
 
 
 def _handle_http_error(exc):
-    if exc.code == 413:
+    """JSON body for the HTTP errors Flask raises itself (404 route, 405, 413, ...)."""
+    code = getattr(exc, "code", 500) or 500
+    if code == 413:
         logger.warning("upload rejected: larger than %d bytes",
                        current_app.config["MAX_CONTENT_LENGTH"])
-    return _error(exc.code, exc.description or exc.name)
-
-
-def _handle_unexpected_error(exc):
-    logger.exception("unhandled error on %s %s", request.method, request.path)
-    return _error(500, "internal server error")
+    if code >= 500:
+        logger.error("server error on %s %s: %s", request.method, request.path, exc,
+                     exc_info=getattr(exc, "original_exception", None))
+        return _error(code, "internal server error")
+    return _error(code, getattr(exc, "description", None) or str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +342,8 @@ def create_app(db_path=None, upload_dir=None):
     app.add_url_rule("/get_video_url", "get_video_url", get_video_url, methods=["GET"])
     app.add_url_rule("/media/<path:filename>", "media", media, methods=["GET"])
     app.add_url_rule("/videos", "videos", videos, methods=["GET"])
-    app.register_error_handler(HTTPException, _handle_http_error)
-    app.register_error_handler(Exception, _handle_unexpected_error)
+    for code in JSON_ERROR_CODES:
+        app.register_error_handler(code, _handle_http_error)
 
     logger.info("app ready: db=%s uploads=%s max_upload=%d bytes",
                 app.config["DB_PATH"], app.config["UPLOAD_DIR"],

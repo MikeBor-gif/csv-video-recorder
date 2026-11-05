@@ -121,9 +121,11 @@ def PreviewVideo(video_url: str, view_seconds: float = DEFAULT_VIEW_SECONDS,
         try:
             page = browser.new_page()
             try:
-                page.goto(video_url)
+                response = page.goto(video_url)
             except PlaywrightError as exc:
                 raise VideoClientError(f"preview of {video_url} failed: {exc}") from exc
+            if response is not None and not response.ok:
+                raise VideoClientError(f"preview of {video_url} failed: HTTP {response.status}")
             mode = f"{view_seconds:g}s" if view_seconds > 0 else "until Enter"
             _log(company_name, f"preview opened: {video_url} ({mode})")
             if view_seconds > 0:
