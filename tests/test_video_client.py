@@ -1,7 +1,7 @@
 """Tests for video_client.py against a live web_service running in a background thread.
 
 PreviewVideo opens a visible browser and is verified manually, not here.
-Run: python -m unittest discover -s tests -v
+Run inside the container: docker compose exec -T web python -m unittest discover -s tests -v
 """
 
 import inspect
@@ -25,6 +25,7 @@ import requests  # noqa: E402
 
 import video_client  # noqa: E402
 import web_service  # noqa: E402
+from tests import pg_helpers  # noqa: E402
 
 
 class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -47,9 +48,10 @@ class VideoClientTestCase(unittest.TestCase):
     def setUpClass(cls):
         if not os.environ.get("WEB_SERVICE_LOG_LEVEL"):
             logging.disable(logging.CRITICAL)
+        db_config = pg_helpers.test_db_config()
+        pg_helpers.reset_videos_table(db_config)
         cls.tmp = Path(tempfile.mkdtemp(prefix="video_client_test_"))
-        app = web_service.create_app(db_path=cls.tmp / "videos.db",
-                                     upload_dir=cls.tmp / "uploads")
+        app = web_service.create_app(db_config=db_config, upload_dir=cls.tmp / "uploads")
         cls.server = make_server("127.0.0.1", 0, app, server_class=_ThreadingWSGIServer,
                                  handler_class=_QuietHandler)
         cls.server_url = f"http://127.0.0.1:{cls.server.server_port}"

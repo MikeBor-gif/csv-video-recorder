@@ -1,13 +1,12 @@
-"""Tests for web_service.py (Flask test client, temporary database and uploads folder).
+"""Tests for web_service.py (Flask test client, PostgreSQL test database, temporary uploads).
 
-Run: python -m unittest discover -s tests -v
+Run inside the container: docker compose exec -T web python -m unittest discover -s tests -v
 """
 
 import io
 import logging
 import os
 import shutil
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -17,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import web_service  # noqa: E402
+from tests import pg_helpers  # noqa: E402
 
 SCHEMA_COLUMNS = ["id", "company_name", "file_path", "video_url", "created_at", "updated_at"]
 
@@ -33,9 +33,10 @@ def tearDownModule():
 class WebServiceTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="web_service_test_"))
-        self.db_path = self.tmp / "videos.db"
+        self.db_config = pg_helpers.test_db_config()
+        pg_helpers.reset_videos_table(self.db_config)
         self.upload_dir = self.tmp / "uploads"
-        self.app = web_service.create_app(db_path=self.db_path, upload_dir=self.upload_dir)
+        self.app = web_service.create_app(db_config=self.db_config, upload_dir=self.upload_dir)
         self.client = self.app.test_client()
 
     def tearDown(self):
@@ -52,22 +53,26 @@ class WebServiceTestCase(unittest.TestCase):
         )
 
     def query(self, sql, params=()):
-        connection = sqlite3.connect(str(self.db_path))
-        try:
-            return connection.execute(sql, params).fetchall()
-        finally:
-            connection.close()
+        return pg_helpers.query(self.db_config, sql, params)
 
     # startup ---------------------------------------------------------------
 
-    def test_start_creates_database_and_uploads_folder(self):
-        self.assertTrue(self.db_path.is_file())
+    def test_start_creates_table_and_uploads_folder(self):
+        self.assertEqual(self.query("SELECT to_regclass('videos') IS NOT NULL")[0][0], True)
         self.assertTrue(self.upload_dir.is_dir())
 
     def test_schema_matches_task(self):
-        columns = [row[1] for row in self.query("PRAGMA table_info(videos)")]
-        self.assertEqual(columns, SCHEMA_COLUMNS)
-        self.assertEqual(self.query("PRAGMA journal_mode")[0][0].lower(), "wal")
+        columns = self.query(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 'videos' ORDER BY ordinal_position"
+        )
+        self.assertEqual([name for name, _ in columns], SCHEMA_COLUMNS)
+        self.assertEqual(dict(columns)["created_at"], "timestamp with time zone")
+        unique = self.query(
+            "SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'videos' "
+            "AND indexdef LIKE '%%UNIQUE%%(company_name)%%'"
+        )[0][0]
+        self.assertEqual(unique, 1)
 
     # POST /upload ----------------------------------------------------------
 
@@ -90,7 +95,8 @@ class WebServiceTestCase(unittest.TestCase):
     def test_database_stores_no_video_bytes(self):
         self.upload("ACME GmbH", b"x" * 4096)
         types = self.query(
-            "SELECT typeof(file_path), typeof(video_url), length(file_path) FROM videos"
+            "SELECT pg_typeof(file_path)::text, pg_typeof(video_url)::text, length(file_path) "
+            "FROM videos"
         )[0]
         self.assertEqual(types[:2], ("text", "text"))
         self.assertLess(types[2], 4096)
@@ -230,10 +236,67 @@ class WebServiceTestCase(unittest.TestCase):
         self.assertEqual(set(records[0]), {"company_name", "file_path", "video_url",
                                            "created_at", "updated_at"})
 
+    def test_videos_dates_are_iso_strings(self):
+        self.upload("ACME GmbH")
+        record = self.client.get("/videos").json["videos"][0]
+        self.assertRegex(record["created_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+    # service endpoints -----------------------------------------------------
+
+    def test_health_reports_database_ok(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {"status": "ok"})
+
+    def test_index_lists_endpoints(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("POST /upload", response.json["endpoints"])
+
     def test_unknown_route_returns_json_404(self):
         response = self.client.get("/nope")
         self.assertEqual(response.status_code, 404)
         self.assertIn("error", response.json)
+
+
+class DatabaseSettingsTestCase(unittest.TestCase):
+    """Settings and startup behaviour that need no running database."""
+
+    VARIABLES = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
+
+    def setUp(self):
+        self.saved = {name: os.environ.get(name) for name in self.VARIABLES}
+        os.environ.update({"DB_HOST": "db", "DB_NAME": "videos",
+                           "DB_USER": "video_user", "DB_PASSWORD": "secret"})
+        os.environ.pop("DB_PORT", None)
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def test_config_is_read_from_environment(self):
+        self.assertEqual(web_service.db_config_from_env(), {
+            "host": "db", "port": 5432, "dbname": "videos",
+            "user": "video_user", "password": "secret",
+        })
+
+    def test_missing_variable_raises(self):
+        del os.environ["DB_HOST"]
+        with self.assertRaisesRegex(RuntimeError, "DB_HOST"):
+            web_service.db_config_from_env()
+
+    def test_invalid_port_raises(self):
+        os.environ["DB_PORT"] = "abc"
+        with self.assertRaisesRegex(RuntimeError, "DB_PORT"):
+            web_service.db_config_from_env()
+
+    def test_wait_for_db_gives_up_after_retries(self):
+        config = {"host": "127.0.0.1", "port": 1, "dbname": "x", "user": "x", "password": "x"}
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            web_service.wait_for_db(config, retries=2, delay=0)
 
 
 if __name__ == "__main__":
