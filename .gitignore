@@ -13,3 +13,6 @@ uploads/
 videos.db
 videos.db-wal
 videos.db-shm
+
+# Docker Compose secrets
+.env
