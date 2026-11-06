@@ -74,6 +74,10 @@ def http(method, url, body=None, headers=None):
             return response.status, response.headers, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.headers, exc.read()
+    except (urllib.error.URLError, OSError) as exc:
+        # Service not reachable: report a failed check instead of a traceback.
+        reason = getattr(exc, "reason", exc)
+        return 0, {}, f"connection failed: {reason}".encode("utf-8")
 
 
 def http_json(method, url, body=None, headers=None):
@@ -222,6 +226,9 @@ def main():
     logs = compose("logs", "web", quiet=True).stdout
     check("database ready" in logs, "web log contains 'database ready'")
     check("Traceback" not in logs, "web log has no Python tracebacks")
+
+    print(f"\n[NOTE] the test record '{COMPANY}' and its video stay in the database "
+          "and the uploads volume (re-runs overwrite them).")
 
     if args.down_after:
         step("stop containers (volumes are kept)")

@@ -293,6 +293,48 @@ class DatabaseSettingsTestCase(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "DB_PORT"):
             web_service.db_config_from_env()
 
+    def test_wsgi_app_does_not_repeat_full_wait_after_failed_start(self):
+        # Apache re-imports the .wsgi script on every request after a failed start;
+        # each of those requests must not block for the whole startup wait again.
+        os.environ.update({"DB_CONNECT_RETRIES": "3", "DB_CONNECT_DELAY": "0"})
+        self.addCleanup(os.environ.pop, "DB_CONNECT_RETRIES", None)
+        self.addCleanup(os.environ.pop, "DB_CONNECT_DELAY", None)
+        self.addCleanup(setattr, web_service, "_wsgi_app", None)
+        self.addCleanup(setattr, web_service, "_startup_failed", False)
+        attempts = []
+
+        def refuse(config):
+            attempts.append(config["host"])
+            raise web_service.psycopg2.OperationalError("connection refused")
+
+        original_connect = web_service._connect
+        web_service._connect = refuse
+        self.addCleanup(setattr, web_service, "_connect", original_connect)
+
+        with self.assertRaises(RuntimeError):
+            web_service.app  # first start: full wait (3 attempts), then failure
+        self.assertEqual(len(attempts), 3)
+        with self.assertRaises(RuntimeError):
+            web_service.app  # next request: one quick attempt, not another full wait
+        self.assertEqual(len(attempts), 4)
+
+    def test_close_db_closes_connection_when_rollback_fails(self):
+        class BrokenConnection:
+            closed = False
+
+            def rollback(self):
+                raise web_service.psycopg2.InterfaceError("connection already closed")
+
+            def close(self):
+                self.closed = True
+
+        connection = BrokenConnection()
+        app = web_service.Flask(__name__)
+        with app.app_context():
+            web_service.g.db = connection
+            web_service.close_db(RuntimeError("request failed"))
+        self.assertTrue(connection.closed)
+
     def test_wait_for_db_gives_up_after_retries(self):
         config = {"host": "127.0.0.1", "port": 1, "dbname": "x", "user": "x", "password": "x"}
         with self.assertRaisesRegex(RuntimeError, "unavailable"):

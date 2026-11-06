@@ -178,9 +178,9 @@ def wait_for_db(config, retries=None, delay=None):
     raise RuntimeError(f"database {_describe(config)} is unavailable: {last_error}")
 
 
-def init_db(config):
+def init_db(config, retries=None):
     """Wait for PostgreSQL and create the ``videos`` table if it does not exist."""
-    connection = wait_for_db(config)
+    connection = wait_for_db(config, retries=retries)
     try:
         with connection.cursor() as cursor:
             cursor.execute(SCHEMA_SQL)
@@ -202,9 +202,14 @@ def close_db(exc=None):
     connection = g.pop("db", None)
     if connection is None:
         return
-    if exc is not None:
-        connection.rollback()
-    connection.close()
+    try:
+        if exc is not None:
+            connection.rollback()
+    except psycopg2.Error as rollback_error:
+        logger.warning("[FIX] rollback failed on a broken connection: %s",
+                       str(rollback_error).strip())
+    finally:
+        connection.close()
     logger.debug("DB connection closed")
 
 
@@ -452,8 +457,11 @@ def configure_logging():
     )
 
 
-def create_app(db_config=None, upload_dir=None):
-    """Build the Flask app; settings default to DB_* and UPLOAD_DIR environment variables."""
+def create_app(db_config=None, upload_dir=None, db_retries=None):
+    """Build the Flask app; settings default to DB_* and UPLOAD_DIR environment variables.
+
+    ``db_retries`` overrides DB_CONNECT_RETRIES for the startup wait.
+    """
     app = Flask(__name__)
     app.config["DB_CONFIG"] = dict(db_config or db_config_from_env())
     upload_dir = upload_dir or os.environ.get("UPLOAD_DIR") or DEFAULT_UPLOAD_DIR
@@ -462,7 +470,7 @@ def create_app(db_config=None, upload_dir=None):
     app.json.sort_keys = False
 
     Path(app.config["UPLOAD_DIR"]).mkdir(parents=True, exist_ok=True)
-    init_db(app.config["DB_CONFIG"])
+    init_db(app.config["DB_CONFIG"], retries=db_retries)
 
     app.teardown_appcontext(close_db)
     app.add_url_rule("/", "index", index, methods=["GET"])
@@ -481,19 +489,32 @@ def create_app(db_config=None, upload_dir=None):
 
 
 _wsgi_app = None
+_startup_failed = False
 
 
 def __getattr__(name):
     """``from web_service import app`` (the .wsgi file) builds the app once, on first use.
 
     Plain ``import web_service`` (tests, the dev server) never touches the database.
+    If the startup wait ran out, mod_wsgi re-imports the .wsgi file on every request;
+    those retries make one quick attempt instead of blocking for the whole wait again.
     """
-    global _wsgi_app
+    global _wsgi_app, _startup_failed
     if name != "app":
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     if _wsgi_app is None:
         configure_logging()
-        _wsgi_app = create_app()
+        retries = 1 if _startup_failed else None
+        try:
+            _wsgi_app = create_app(db_retries=retries)
+        except RuntimeError:
+            if not _startup_failed:
+                logger.error("[FIX] startup failed; next requests retry the database once each")
+            _startup_failed = True
+            raise
+        if _startup_failed:
+            logger.info("[FIX] database reachable again; app started")
+            _startup_failed = False
     return _wsgi_app
 
 

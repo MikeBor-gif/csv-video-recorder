@@ -64,7 +64,7 @@ python scripts/verify_docker.py
 | `web` ждёт готовности `db` и не падает | у `web` нет перезапусков, в логе есть `database ready`, нет `Traceback` |
 | unit-тесты | `python -m unittest` внутри контейнера `web` |
 
-В конце выводится `ALL CHECKS PASSED` (код выхода `0`). Опции: `--skip-build`, `--skip-tests`, `--down-after` (остановить контейнеры, тома сохраняются), `--base-url`.
+В конце выводится `ALL CHECKS PASSED` (код выхода `0`). Тестовая запись `Verify Docker GmbH` и её видео остаются в базе и томе `uploads` (повторный запуск их перезаписывает). Опции: `--skip-build`, `--skip-tests`, `--down-after` (остановить контейнеры, тома сохраняются), `--base-url`.
 
 ### Ручная проверка
 
@@ -111,6 +111,12 @@ pip install -r requirements.txt
 python -m playwright install chromium
 
 python capture_video.py             # или: python capture_video.py path/to/other.csv
+```
+
+`requirements.txt` включает `mod-wsgi` для Docker-образа. На Windows и macOS он пропускается. На Linux `pip` собирает его из исходников, поэтому сначала нужны заголовки Apache и компилятор, иначе установка падает с `The 'apxs' command appears not to be installed`:
+
+```bash
+sudo apt install apache2-dev gcc    # Debian / Ubuntu
 ```
 
 Откроется окно Chromium, сценарий выполнится для каждой строки `input.csv` (~17 c на строку). Готовые видео — в папке `video/`.
