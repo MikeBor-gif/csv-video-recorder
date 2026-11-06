@@ -1,20 +1,28 @@
 """Web service that stores recorded videos and looks them up by company name.
 
-Run:  python web_service.py   (listens on 0.0.0.0:8000 by default)
+Run in Docker (Apache + mod_wsgi, PostgreSQL):  docker compose up --build
+Run locally (Flask dev server):                 python web_service.py
 
 Endpoints:
     POST /upload                         UploadVideo: multipart ``file`` + ``company_name``
     GET  /get_video_url?company_name=... GetVideoURL: 200 JSON or 404
     GET  /media/<filename>               serves an uploaded video file
     GET  /videos                         lists all records
+    GET  /health                         database check for the container healthcheck
+    GET  /                               short service description
 
-Storage: video files live in ``uploads/`` next to this script; the SQLite
-database ``videos.db`` (same folder) keeps only the company name, the absolute
-file path and the public URL -- never the video bytes.
+Storage: video files live in the uploads folder; the PostgreSQL table ``videos``
+keeps only the company name, the absolute file path and the public URL --
+never the video bytes.
 
 Environment variables:
-    FLASK_HOST             bind address (default 0.0.0.0)
-    FLASK_PORT             port (default 8000)
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+                           PostgreSQL connection (required; DB_PORT defaults to 5432)
+    DB_CONNECT_RETRIES     attempts to reach the database on startup (default 30)
+    DB_CONNECT_DELAY       seconds between attempts (default 2)
+    UPLOAD_DIR             folder for video files (default: uploads/ next to this file)
+    FLASK_HOST             bind address of the dev server (default 0.0.0.0)
+    FLASK_PORT             port of the dev server (default 8000)
     WEB_SERVICE_LOG_LEVEL  DEBUG, INFO, WARNING, ERROR (default INFO)
     MAX_UPLOAD_MB          maximum upload size in megabytes (default 512)
 """
@@ -24,14 +32,16 @@ import logging
 import mimetypes
 import os
 import re
-import sqlite3
 import sys
+import time
 import unicodedata
 import uuid
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import quote
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, current_app, g, jsonify, request, send_from_directory
 
 # ---------------------------------------------------------------------------
@@ -39,12 +49,17 @@ from flask import Flask, current_app, g, jsonify, request, send_from_directory
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = BASE_DIR / "videos.db"
 DEFAULT_UPLOAD_DIR = BASE_DIR / "uploads"
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 DEFAULT_MAX_UPLOAD_MB = 512
+
+DEFAULT_DB_PORT = 5432
+DEFAULT_DB_CONNECT_RETRIES = 30
+DEFAULT_DB_CONNECT_DELAY = 2.0
+DB_CONNECT_TIMEOUT_SECONDS = 5
+REQUIRED_DB_VARIABLES = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
 
 ALLOWED_EXTENSIONS = {".webm", ".mp4", ".ogg", ".mov"}
 DEFAULT_EXTENSION = ".webm"
@@ -58,21 +73,18 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
-# SQLite waits this long for a competing writer before "database is locked".
-DB_TIMEOUT_SECONDS = 10
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS videos (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    company_name TEXT    NOT NULL UNIQUE,
-    file_path    TEXT    NOT NULL,  -- absolute path to the file on disk
-    video_url    TEXT    NOT NULL,  -- public URL to the video
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    id           SERIAL      PRIMARY KEY,
+    company_name TEXT        NOT NULL UNIQUE,
+    file_path    TEXT        NOT NULL,  -- absolute path to the file on disk
+    video_url    TEXT        NOT NULL,  -- public URL to the video
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
-# Windows may not know the .webm type; browsers need it to play the file inline.
+# Some systems do not know the .webm type; browsers need it to play the file inline.
 mimetypes.add_type("video/webm", ".webm")
 mimetypes.add_type("video/ogg", ".ogg")
 mimetypes.add_type("video/mp4", ".mp4")
@@ -81,85 +93,170 @@ mimetypes.add_type("video/quicktime", ".mov")
 logger = logging.getLogger("web_service")
 
 # ---------------------------------------------------------------------------
+# Settings from the environment
+# ---------------------------------------------------------------------------
+
+
+def _env_number(name, default, cast):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using %s", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("negative %s=%r; using %s", name, raw, default)
+        return default
+    return value
+
+
+def db_config_from_env() -> dict:
+    """Read the PostgreSQL connection settings from DB_* environment variables."""
+    missing = [name for name in REQUIRED_DB_VARIABLES if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError("missing environment variable(s): " + ", ".join(missing))
+    raw_port = os.environ.get("DB_PORT") or str(DEFAULT_DB_PORT)
+    try:
+        port = int(raw_port)
+    except ValueError:
+        raise RuntimeError(f"invalid DB_PORT={raw_port!r}: must be an integer") from None
+    return {
+        "host": os.environ["DB_HOST"],
+        "port": port,
+        "dbname": os.environ["DB_NAME"],
+        "user": os.environ["DB_USER"],
+        "password": os.environ["DB_PASSWORD"],
+    }
+
+
+def _describe(config) -> str:
+    """Connection target for logs -- never includes the password."""
+    return f"{config['user']}@{config['host']}:{config['port']}/{config['dbname']}"
+
+
+# ---------------------------------------------------------------------------
 # Database layer
 # ---------------------------------------------------------------------------
 
 
-def _connect(db_path):
-    connection = sqlite3.connect(str(db_path), timeout=DB_TIMEOUT_SECONDS)
-    connection.row_factory = sqlite3.Row
-    connection.execute(f"PRAGMA busy_timeout = {DB_TIMEOUT_SECONDS * 1000}")
-    return connection
+def _connect(config):
+    return psycopg2.connect(
+        host=config["host"],
+        port=config["port"],
+        dbname=config["dbname"],
+        user=config["user"],
+        password=config["password"],
+        connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+        cursor_factory=RealDictCursor,
+    )
 
 
-def init_db(db_path):
-    """Create the database file and the ``videos`` table if they do not exist."""
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = _connect(db_path)
+def wait_for_db(config, retries=None, delay=None):
+    """Return an open connection once PostgreSQL answers; raise RuntimeError after ``retries``."""
+    if retries is None:
+        retries = _env_number("DB_CONNECT_RETRIES", DEFAULT_DB_CONNECT_RETRIES, int)
+    if delay is None:
+        delay = _env_number("DB_CONNECT_DELAY", DEFAULT_DB_CONNECT_DELAY, float)
+    attempts = max(1, retries)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            connection = _connect(config)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            logger.info("database ready after %d attempt(s): %s", attempt, _describe(config))
+            return connection
+        except psycopg2.OperationalError as exc:
+            last_error = exc
+            logger.warning("database not ready (attempt %d/%d): %s",
+                           attempt, attempts, str(exc).strip())
+            if attempt < attempts:
+                time.sleep(delay)
+    logger.error("database unavailable after %d attempt(s): %s", attempts, _describe(config))
+    raise RuntimeError(f"database {_describe(config)} is unavailable: {last_error}")
+
+
+def init_db(config):
+    """Wait for PostgreSQL and create the ``videos`` table if it does not exist."""
+    connection = wait_for_db(config)
     try:
-        connection.executescript(SCHEMA_SQL)
-        # WAL lets readers work while one upload writes; the mode is stored in the file.
-        mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        with connection.cursor() as cursor:
+            cursor.execute(SCHEMA_SQL)
         connection.commit()
     finally:
         connection.close()
-    logger.info("DB initialised at %s (journal_mode=%s)", db_path, mode)
+    logger.info("DB initialised: %s", _describe(config))
 
 
 def get_db():
-    """Return the SQLite connection of the current request (one per request/thread)."""
+    """Return the PostgreSQL connection of the current request (one per request)."""
     if "db" not in g:
-        g.db = _connect(current_app.config["DB_PATH"])
+        g.db = _connect(current_app.config["DB_CONFIG"])
         logger.debug("DB connection opened")
     return g.db
 
 
-def close_db(_exc=None):
+def close_db(exc=None):
     connection = g.pop("db", None)
-    if connection is not None:
-        connection.close()
-        logger.debug("DB connection closed")
+    if connection is None:
+        return
+    if exc is not None:
+        connection.rollback()
+    connection.close()
+    logger.debug("DB connection closed")
 
 
 def upsert_video(db, company_name, file_path, video_url):
     """Insert a record or update the existing one for ``company_name``."""
-    db.execute(
-        """
-        INSERT INTO videos (company_name, file_path, video_url)
-        VALUES (?, ?, ?)
-        ON CONFLICT(company_name) DO UPDATE SET
-            file_path  = excluded.file_path,
-            video_url  = excluded.video_url,
-            updated_at = datetime('now')
-        """,
-        (company_name, file_path, video_url),
-    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO videos (company_name, file_path, video_url)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (company_name) DO UPDATE SET
+                file_path  = EXCLUDED.file_path,
+                video_url  = EXCLUDED.video_url,
+                updated_at = NOW()
+            """,
+            (company_name, file_path, video_url),
+        )
     db.commit()
     logger.debug("DB upsert company=%r file_path=%r", company_name, file_path)
 
 
-def find_video(db: sqlite3.Connection, company_name: str) -> Optional[sqlite3.Row]:
-    row = db.execute(
-        "SELECT * FROM videos WHERE company_name = ?", (company_name,)
-    ).fetchone()
+def find_video(db, company_name: str) -> Optional[dict]:
+    with db.cursor() as cursor:
+        cursor.execute("SELECT * FROM videos WHERE company_name = %s", (company_name,))
+        row = cursor.fetchone()
     logger.debug("DB find company=%r found=%s", company_name, row is not None)
     return row
 
 
-def list_videos(db: sqlite3.Connection) -> List[dict]:
-    rows = db.execute(
-        "SELECT company_name, file_path, video_url, created_at, updated_at "
-        "FROM videos ORDER BY updated_at DESC, id DESC"
-    ).fetchall()
-    return [dict(row) for row in rows]
+def list_videos(db) -> List[dict]:
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT company_name, file_path, video_url, created_at, updated_at "
+            "FROM videos ORDER BY updated_at DESC, id DESC"
+        )
+        rows = cursor.fetchall()
+    records = []
+    for row in rows:
+        record = dict(row)
+        record["created_at"] = record["created_at"].isoformat()
+        record["updated_at"] = record["updated_at"].isoformat()
+        records.append(record)
+    return records
 
 
-def _owner_of_file(db: sqlite3.Connection, file_path: str) -> Optional[str]:
-    # NOCASE: on Windows/macOS "ACME.webm" and "acme.webm" are the same file.
-    row = db.execute(
-        "SELECT company_name FROM videos WHERE file_path = ? COLLATE NOCASE", (file_path,)
-    ).fetchone()
+def _owner_of_file(db, file_path: str) -> Optional[str]:
+    # Case-insensitive: on Windows/macOS "ACME.webm" and "acme.webm" are the same file.
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT company_name FROM videos WHERE lower(file_path) = lower(%s)", (file_path,)
+        )
+        row = cursor.fetchone()
     return row["company_name"] if row else None
 
 
@@ -298,6 +395,30 @@ def videos():
     return jsonify({"videos": records})
 
 
+def health():
+    """Healthcheck: 200 when PostgreSQL answers, 503 otherwise."""
+    try:
+        with get_db().cursor() as cursor:
+            cursor.execute("SELECT 1")
+    except psycopg2.Error as exc:
+        logger.error("health check failed: %s", str(exc).strip())
+        return jsonify({"status": "unavailable"}), 503
+    return jsonify({"status": "ok"})
+
+
+def index():
+    return jsonify({
+        "service": "video web service",
+        "endpoints": [
+            "POST /upload",
+            "GET /get_video_url?company_name=<name>",
+            "GET /media/<filename>",
+            "GET /videos",
+            "GET /health",
+        ],
+    })
+
+
 def _handle_http_error(exc):
     """JSON body for the HTTP errors Flask raises itself (404 route, 405, 413, ...)."""
     code = getattr(exc, "code", 500) or 500
@@ -317,46 +438,67 @@ def _handle_http_error(exc):
 
 
 def _max_upload_bytes():
-    raw = os.environ.get("MAX_UPLOAD_MB", str(DEFAULT_MAX_UPLOAD_MB))
-    try:
-        megabytes = float(raw)
-    except ValueError:
-        logger.warning("invalid MAX_UPLOAD_MB=%r; using %d", raw, DEFAULT_MAX_UPLOAD_MB)
-        megabytes = DEFAULT_MAX_UPLOAD_MB
+    megabytes = _env_number("MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB, float)
     return int(megabytes * 1024 * 1024)
 
 
-def create_app(db_path=None, upload_dir=None):
-    """Build the Flask app; paths default to videos.db and uploads/ next to this file."""
-    app = Flask(__name__)
-    app.config["DB_PATH"] = str(Path(db_path or DEFAULT_DB_PATH).resolve())
-    app.config["UPLOAD_DIR"] = str(Path(upload_dir or DEFAULT_UPLOAD_DIR).resolve())
-    app.config["MAX_CONTENT_LENGTH"] = _max_upload_bytes()
-    app.json.sort_keys = False
-
-    Path(app.config["UPLOAD_DIR"]).mkdir(parents=True, exist_ok=True)
-    init_db(app.config["DB_PATH"])
-
-    app.teardown_appcontext(close_db)
-    app.add_url_rule("/upload", "upload", upload, methods=["POST"])
-    app.add_url_rule("/get_video_url", "get_video_url", get_video_url, methods=["GET"])
-    app.add_url_rule("/media/<path:filename>", "media", media, methods=["GET"])
-    app.add_url_rule("/videos", "videos", videos, methods=["GET"])
-    for code in JSON_ERROR_CODES:
-        app.register_error_handler(code, _handle_http_error)
-
-    logger.info("app ready: db=%s uploads=%s max_upload=%d bytes",
-                app.config["DB_PATH"], app.config["UPLOAD_DIR"],
-                app.config["MAX_CONTENT_LENGTH"])
-    return app
-
-
-def main():
+def configure_logging():
+    """Send logs to stderr (docker compose logs) at WEB_SERVICE_LOG_LEVEL."""
     level = os.environ.get("WEB_SERVICE_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
     )
+
+
+def create_app(db_config=None, upload_dir=None):
+    """Build the Flask app; settings default to DB_* and UPLOAD_DIR environment variables."""
+    app = Flask(__name__)
+    app.config["DB_CONFIG"] = dict(db_config or db_config_from_env())
+    upload_dir = upload_dir or os.environ.get("UPLOAD_DIR") or DEFAULT_UPLOAD_DIR
+    app.config["UPLOAD_DIR"] = str(Path(upload_dir).resolve())
+    app.config["MAX_CONTENT_LENGTH"] = _max_upload_bytes()
+    app.json.sort_keys = False
+
+    Path(app.config["UPLOAD_DIR"]).mkdir(parents=True, exist_ok=True)
+    init_db(app.config["DB_CONFIG"])
+
+    app.teardown_appcontext(close_db)
+    app.add_url_rule("/", "index", index, methods=["GET"])
+    app.add_url_rule("/upload", "upload", upload, methods=["POST"])
+    app.add_url_rule("/get_video_url", "get_video_url", get_video_url, methods=["GET"])
+    app.add_url_rule("/media/<path:filename>", "media", media, methods=["GET"])
+    app.add_url_rule("/videos", "videos", videos, methods=["GET"])
+    app.add_url_rule("/health", "health", health, methods=["GET"])
+    for code in JSON_ERROR_CODES:
+        app.register_error_handler(code, _handle_http_error)
+
+    logger.info("app ready: db=%s uploads=%s max_upload=%d bytes",
+                _describe(app.config["DB_CONFIG"]), app.config["UPLOAD_DIR"],
+                app.config["MAX_CONTENT_LENGTH"])
+    return app
+
+
+_wsgi_app = None
+
+
+def __getattr__(name):
+    """``from web_service import app`` (the .wsgi file) builds the app once, on first use.
+
+    Plain ``import web_service`` (tests, the dev server) never touches the database.
+    """
+    global _wsgi_app
+    if name != "app":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if _wsgi_app is None:
+        configure_logging()
+        _wsgi_app = create_app()
+    return _wsgi_app
+
+
+def main():
+    configure_logging()
     host = os.environ.get("FLASK_HOST", DEFAULT_HOST)
     raw_port = os.environ.get("FLASK_PORT", str(DEFAULT_PORT))
     try:
@@ -365,7 +507,11 @@ def main():
         logger.error("invalid FLASK_PORT=%r: must be an integer", raw_port)
         return 2
 
-    app = create_app()
+    try:
+        app = create_app()
+    except RuntimeError as exc:
+        logger.error("cannot start: %s", exc)
+        return 1
     logger.info("listening on %s:%d", host, port)
     app.run(host=host, port=port, threaded=True)
     return 0

@@ -2,3 +2,7 @@
 playwright>=1.51
 flask>=2.2
 requests>=2.28
+# PostgreSQL driver (psycopg2).
+psycopg2-binary>=2.9
+# Apache mod_wsgi; built inside the Docker image (needs apache2-dev), skipped on Windows/macOS hosts.
+mod-wsgi>=5.0; sys_platform == "linux"
