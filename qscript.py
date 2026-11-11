@@ -9,11 +9,16 @@ Log verbosity is controlled by the QSCRIPT_LOG_LEVEL environment variable
 (DEBUG, INFO, WARN, ERROR; default INFO).
 """
 
+import json
+import math
 import os
 import random
 import re
 import time
+import uuid
 from pathlib import Path
+
+from zoom_events import parse_sidecar
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -28,6 +33,7 @@ PATH_TO_VIDEO_FOLDER = "./video"
 VIDEO_SIZE = {"width": 1280, "height": 720}
 # DuckDuckGo serves headless browsers less reliably; the video is recorded either way.
 HEADLESS = False
+ZOOM_DEMO = False
 
 SEARCH_BOX = 'textarea[name="q"]'
 SEARCH_BUTTON = 'form button[type="submit"]'
@@ -54,6 +60,130 @@ _WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
 # The page of the running scenario; lets ShowCallout keep the 4-argument signature
 # required by the task. Set and cleared only by CaptureVideo_Magento.
 _active_page = None
+
+# All zoom state lives in a per-recording collector, not in this injected document.
+ZOOM_JS = r"""
+(() => {
+  if (window !== window.top) return;
+  let point = {x: 0, y: 0};
+  let mouseMoved = false;
+  let pending = window.__qsZoomEvent({action: 'state'}).then(state => {
+    // A bootstrap reply is a snapshot; a newer mousemove must win.
+    if (!mouseMoved) point = {x: state.x, y: state.y};
+    return state;
+  });
+  window.__zoomReady = pending;
+  window.addEventListener('mousemove', e => {
+    mouseMoved = true;
+    point = {x:e.clientX,y:e.clientY};
+    window.__qsZoomEvent({action:'position',...point}).catch(console.error);
+  }, true);
+  const ring = (event) => {
+    if (!document.documentElement) return;
+    const el = document.createElement('div');
+    el.dataset.zoomIndicator = event.type;
+    el.style.cssText = `position:fixed;left:${event.x}px;top:${event.y}px;
+      width:50px;height:50px;border:4px solid ${event.type==='in'?'#00dd88':'#ff6688'};
+      border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;
+      z-index:2147483647;transition:opacity .45s;`;
+    document.documentElement.append(el);
+    setTimeout(() => {el.style.opacity='0';},100);
+    setTimeout(() => el.remove(),600);
+  };
+  window.__zoomAt = (x,y) => {
+    const payload = {action:'toggle',x,y,epoch:performance.timeOrigin+performance.now()};
+    const accepted = pending.then(() => window.__qsZoomEvent(payload)).then(event => {
+      ring(event); return event;
+    });
+    pending = accepted.catch(() => {});
+    return accepted;
+  };
+  window.__zoomFlush = () => pending;
+  window.addEventListener('keydown', e => {
+    if (e.key !== 'F5') return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (!e.repeat) window.__zoomAt(point.x,point.y).catch(console.error);
+  },true);
+})();
+"""
+
+
+class _ZoomCapture:
+    def __init__(self, epoch=None):
+        self.epoch = time.time() * 1000 if epoch is None else epoch
+        self.events = []
+        self.page = None
+        self.calibration = None
+        self.point = dict(x=0, y=0)
+
+    def binding(self, source, payload):
+        if self.page is None:
+            self.page = source["page"]
+        if source["page"] != self.page or source["frame"] != self.page.main_frame:
+            raise ValueError("zoom is only accepted from the recorded top-level page")
+        if payload.get("action") == "state":
+            last = self.events[-1] if self.events else dict(x=0, y=0, type="out")
+            _log("zoom", f"[FIX:zoom-bootstrap] state snapshot mouse={self.point}", "DEBUG")
+            return dict(last, **self.point)
+        if payload.get("action") == "position":
+            for axis, size in (("x", VIDEO_SIZE["width"]), ("y", VIDEO_SIZE["height"])):
+                value = payload.get(axis)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError("invalid mouse coordinate")
+                self.point[axis] = max(0, min(size-1, value))
+            return None
+        epoch = payload.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(epoch):
+            raise ValueError("invalid zoom timestamp")
+        if payload.get("action") == "calibrate":
+            self.calibration = dict(t=max(0, (epoch-self.epoch)/1000), marker="magenta-square-v1")
+            return self.calibration
+        event = dict(t=max(0, (epoch - self.epoch) / 1000), x=payload.get("x"),
+                     y=payload.get("y"), type="in" if len(self.events) % 2 == 0 else "out")
+        data = self.metadata(self.events + [event])
+        self.events = data["events"]
+        _log("zoom", f"accepted {self.events[-1]}", "DEBUG")
+        return self.events[-1]
+
+    def metadata(self, events=None):
+        data = dict(viewport=VIDEO_SIZE, fps=25, zoom_factor=2.0,
+                    ramp_sec=.5, events=self.events if events is None else events)
+        if self.calibration:
+            data["calibration"] = self.calibration
+        return parse_sidecar(data)
+
+    def save(self, video_path):
+        if not video_path:
+            return None
+        sidecar = Path(str(video_path) + ".zoom.json")
+        if not self.events:
+            sidecar.unlink(missing_ok=True)
+            return video_path
+        temporary = sidecar.with_name(f".{uuid.uuid4().hex}.zoom.part")
+        try:
+            temporary.write_text(json.dumps(self.metadata(), indent=2), encoding="utf-8")
+            os.replace(temporary, sidecar)
+        finally:
+            temporary.unlink(missing_ok=True)
+        _log("zoom", f"saved {len(self.events)} events -> {sidecar}")
+        return video_path
+
+
+def _calibrate_zoom(page):
+    """Visible startup marker lets ffmpeg align wall time to the first recorded frame."""
+    page.evaluate("""async () => {
+      await window.__zoomReady;
+      // Ensure the recorder has emitted its initial frame before the marker edge.
+      await new Promise(resolve => setTimeout(resolve,300));
+      await new Promise(requestAnimationFrame);
+      const marker = document.createElement('div');
+      marker.style.cssText = 'position:fixed;left:0;top:0;width:16px;height:16px;'
+        +'background:rgb(255,0,255);z-index:2147483647;pointer-events:none';
+      document.documentElement.append(marker);
+      await window.__qsZoomEvent({action:'calibrate',epoch:performance.timeOrigin+performance.now()});
+      await new Promise(resolve => setTimeout(resolve,200));
+      marker.remove();
+    }""")
 
 # ---------------------------------------------------------------------------
 # JavaScript resources
@@ -224,6 +354,18 @@ class _Cursor:
         self.page.mouse.move(self.x, self.y)
 
 
+def _toggle_zoom_at_cursor(cursor):
+    point = {"x": cursor.x, "y": cursor.y}
+    _log(cursor.company, f"[FIX:zoom-target] demo toggle at mouse={point}", "DEBUG")
+    try:
+        event = cursor.page.evaluate("(point) => window.__zoomAt(point.x, point.y)", point)
+    except PlaywrightError as exc:
+        _log(cursor.company, f"[FIX:zoom-target] toggle failed at {point}: {exc}", "ERROR")
+        raise
+    _log(cursor.company, f"[FIX:zoom-target] accepted {event['type']} at ({event['x']},{event['y']})", "DEBUG")
+    return event
+
+
 def _type_humanlike(page, company, text):
     _log(company, f'typing query: "{text}"')
     for ch in text:
@@ -309,16 +451,20 @@ def _finalize_video(video, video_dir, company_name, succeeded):
         return None
     company = company_name or "unnamed"
     target = video_dir / f"{_safe_filename(company_name)}.webm"
-    _log(company, f"[FIX] finalizing video -> {target}", "DEBUG")
+    temporary = video_dir / f".{uuid.uuid4().hex}.part.webm"
+    _log(company, f"[FIX:save-video] staging video {temporary} -> {target}", "DEBUG")
     try:
-        if target.exists():
-            target.unlink()
-        video.save_as(str(target))
-    except OSError as exc:
+        video.save_as(str(temporary))
+        os.replace(temporary, target)
+    except (OSError, PlaywrightError) as exc:
         # E.g. the previous video is open in a player (Windows locks it) or the name is too long.
-        _log(company, f"cannot write {target}: {type(exc).__name__}: {exc}", "ERROR")
+        _log(company, f"[FIX:save-video] cannot write {target}: {type(exc).__name__}: {exc}", "ERROR")
         return None
     finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            _log(company, f"[FIX:save-video] cannot remove staging file: {exc}", "WARN")
         # Always remove Playwright's raw recording (random hash name) from the video folder.
         try:
             video.delete()
@@ -387,9 +533,16 @@ def CaptureVideo_Magento(
                 record_video_dir=str(video_dir),
                 record_video_size=VIDEO_SIZE,
             )
+            zoom_capture = _ZoomCapture()
             try:
+                context.expose_binding("__qsZoomEvent", zoom_capture.binding)
                 context.add_init_script(script=OVERLAY_JS)
+                context.add_init_script(script=ZOOM_JS)
                 page = context.new_page()
+                zoom_capture.page = page
+                # Video belongs to the page, not the context. Exclude binding/script setup.
+                zoom_capture.epoch = time.time() * 1000
+                _calibrate_zoom(page)
                 video = page.video
                 _active_page = page
                 cursor = _Cursor(page, company)
@@ -400,10 +553,15 @@ def CaptureVideo_Magento(
                 ShowCallout(query, "#FFFF00", "#000000", True)
                 _log(company, "[FIX] callout started without waiting for it", "DEBUG")
                 cursor.click_locator(page.locator(SEARCH_BOX), "search box")
+                if ZOOM_DEMO:
+                    _toggle_zoom_at_cursor(cursor)
                 _type_humanlike(page, company, query)
+                if ZOOM_DEMO:
+                    _toggle_zoom_at_cursor(cursor)
                 _submit_search(page, cursor)
                 _wait_results(page, cursor)
                 _click_first_result(page, cursor)
+                page.evaluate("() => window.__zoomFlush && window.__zoomFlush()")
                 succeeded = True
             except Exception as exc:
                 _log(company, f"scenario failed: {type(exc).__name__}: {exc}", "ERROR")
@@ -417,7 +575,7 @@ def CaptureVideo_Magento(
 
             # The video must be saved while the Playwright driver is still running.
             try:
-                return _finalize_video(video, video_dir, company_name, succeeded)
+                return zoom_capture.save(_finalize_video(video, video_dir, company_name, succeeded))
             finally:
                 try:
                     browser.close()

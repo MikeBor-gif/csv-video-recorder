@@ -39,6 +39,8 @@ def _parse_args(argv):
     parser.add_argument("--server", metavar="URL",
                         help="web service base URL, e.g. http://127.0.0.1:8000; "
                              "enables upload + preview after each video")
+    parser.add_argument("--zoom-demo", action="store_true",
+                        help="trigger a zoom pair via window.__zoomAt during the scenario")
     parser.add_argument("--view-seconds", type=_non_negative_seconds, default=DEFAULT_VIEW_SECONDS,
                         metavar="N",
                         help="preview time in seconds; 0 keeps the browser open until Enter "
@@ -67,6 +69,7 @@ def main(argv=None):
     csv_path = args.csv_path
     # The video folder may be overridden here before any row is processed.
     qscript.PATH_TO_VIDEO_FOLDER = "./video"
+    qscript.ZOOM_DEMO = args.zoom_demo
 
     video_client = None
     if args.server:

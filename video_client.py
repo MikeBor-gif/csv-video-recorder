@@ -12,6 +12,8 @@ Log verbosity follows QSCRIPT_LOG_LEVEL (DEBUG, INFO, WARN, ERROR; default INFO)
 """
 
 import os
+import math
+from contextlib import ExitStack
 
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
 _LOG_THRESHOLD = _LOG_LEVELS.get(os.environ.get("QSCRIPT_LOG_LEVEL", "INFO").upper(), 20)
@@ -64,20 +66,57 @@ def UploadVideo(server_url: str, video_path: str, company_name: str) -> str:
     _log(company_name, f"uploading {video_path} ({os.path.getsize(video_path)} bytes) -> {url}",
          "DEBUG")
     try:
-        with open(video_path, "rb") as fileobj:
+        with ExitStack() as stack:
+            fileobj = stack.enter_context(open(video_path, "rb"))
+            files = {"file": (os.path.basename(video_path), fileobj)}
+            sidecar = str(video_path) + ".zoom.json"
+            if os.path.isfile(sidecar):
+                files["zoom"] = (os.path.basename(sidecar), stack.enter_context(open(sidecar, "rb")))
+                _log(company_name, f"uploading sidecar {sidecar}", "DEBUG")
             response = requests.post(
                 url,
-                files={"file": (os.path.basename(video_path), fileobj)},
+                files=files,
                 data={"company_name": company_name},
                 timeout=(CONNECT_TIMEOUT_SECONDS, UPLOAD_TIMEOUT_SECONDS),
             )
-    except requests.RequestException as exc:
+    except (requests.RequestException, OSError) as exc:
         raise VideoClientError(f"upload to {url} failed: {exc}") from exc
     if response.status_code != 200:
         raise VideoClientError(f"upload rejected: {_error_message(response)}")
     video_url = _video_url_from(response, company_name)
+    try:
+        job_id = response.json().get("job_id")
+    except (ValueError, AttributeError) as exc:
+        raise VideoClientError("invalid upload response") from exc
+    if job_id:
+        video_url = _process_zoom_job(server_url, job_id, company_name, requests)
     _log(company_name, f"uploaded -> {video_url}", "DEBUG")
     return video_url
+
+
+def _process_zoom_job(server_url, job_id, company_name, requests):
+    try:
+        server_timeout = float(os.environ.get("ZOOM_PROCESS_TIMEOUT", "300"))
+    except ValueError:
+        server_timeout = 300
+    if not math.isfinite(server_timeout) or server_timeout <= 0:
+        server_timeout = 300
+    url = _endpoint(server_url, f"/jobs/{job_id}/process")
+    context = f"original uploaded; processing not completed; job_id={job_id}; check GET /jobs/{job_id}"
+    _log(company_name, f"processing job={job_id}", "DEBUG")
+    try:
+        response = requests.post(url, timeout=(CONNECT_TIMEOUT_SECONDS, server_timeout + 120))
+    except requests.RequestException as exc:
+        raise VideoClientError(f"{context}: {exc}") from exc
+    if response.status_code != 200:
+        raise VideoClientError(f"{context}: {_error_message(response)}")
+    try:
+        payload = response.json()
+        if payload["status"] != "completed" or not payload["processed_video_url"]:
+            raise ValueError("job has no completed result")
+        return payload["processed_video_url"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise VideoClientError(f"{context}: invalid process response") from exc
 
 
 def GetVideoURL(server_url: str, company_name: str) -> str:

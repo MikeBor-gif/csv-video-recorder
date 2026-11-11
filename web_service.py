@@ -28,10 +28,13 @@ Environment variables:
 """
 
 import hashlib
+import json
 import logging
+import math
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import time
 import unicodedata
@@ -43,6 +46,9 @@ from urllib.parse import quote
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, current_app, g, jsonify, request, send_from_directory
+
+from zoom_events import ZoomError, parse_sidecar
+from apply_zoom import process_video
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -82,6 +88,24 @@ CREATE TABLE IF NOT EXISTS videos (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS jobs (
+    id UUID PRIMARY KEY,
+    company_name TEXT NOT NULL,
+    original_video_url TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    sidecar_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    processed_file_path TEXT,
+    processed_video_url TEXT,
+    error TEXT,
+    started_at TIMESTAMPTZ,
+    deadline_at TIMESTAMPTZ,
+    attempt_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_id UUID;
 """
 
 # Some systems do not know the .webm type; browsers need it to play the file inline.
@@ -213,7 +237,7 @@ def close_db(exc=None):
     logger.debug("DB connection closed")
 
 
-def upsert_video(db, company_name, file_path, video_url):
+def upsert_video(db, company_name, file_path, video_url, commit=True):
     """Insert a record or update the existing one for ``company_name``."""
     with db.cursor() as cursor:
         cursor.execute(
@@ -227,7 +251,8 @@ def upsert_video(db, company_name, file_path, video_url):
             """,
             (company_name, file_path, video_url),
         )
-    db.commit()
+    if commit:
+        db.commit()
     logger.debug("DB upsert company=%r file_path=%r", company_name, file_path)
 
 
@@ -263,6 +288,53 @@ def _owner_of_file(db, file_path: str) -> Optional[str]:
         )
         row = cursor.fetchone()
     return row["company_name"] if row else None
+
+
+def _lock_upload(db):
+    # Held until this request's connection closes, including post-commit stale cleanup.
+    # A transaction lock would release before that cleanup and let it delete a newer upload.
+    with db.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_lock(172904821)")
+
+
+def _insert_job(db, job_id, company_name, video_url, source_path, sidecar_path):
+    with db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO jobs (id,company_name,original_video_url,source_path,sidecar_path) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (job_id, company_name, video_url, str(source_path), str(sidecar_path)))
+
+
+def _claim_job(db, job_id, attempt, timeout):
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE jobs SET status='processing', error=NULL, attempt_id=%s, "
+            "started_at=NOW(), deadline_at=NOW()+(%s * INTERVAL '1 second'), updated_at=NOW() "
+            "WHERE id=%s AND status IN ('pending','failed') RETURNING *",
+            (attempt, timeout + 90, str(job_id)))
+        row = cursor.fetchone()
+    db.commit()
+    return row
+
+
+def _complete_job(db, job_id, attempt, output, result_url):
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE jobs SET status='completed', processed_file_path=%s, processed_video_url=%s, "
+            "error=NULL, updated_at=NOW() WHERE id=%s AND attempt_id=%s "
+            "AND status='processing' RETURNING *", (str(output), result_url, str(job_id), attempt))
+        row = cursor.fetchone()
+    db.commit()
+    return row
+
+
+def _fail_job(db, job_id, attempt, message):
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE jobs SET status='failed', error=%s, updated_at=NOW() "
+            "WHERE id=%s AND attempt_id=%s AND status='processing'",
+            (message, str(job_id), attempt))
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -346,23 +418,58 @@ def upload():
         return _error(400, f"unsupported file type {extension!r}",
                       allowed=sorted(ALLOWED_EXTENSIONS))
 
+    zoom_file = request.files.get("zoom")
+    metadata = None
+    if zoom_file is not None:
+        try:
+            metadata = parse_sidecar(zoom_file.read())
+        except ZoomError as exc:
+            logger.warning("upload rejected company=%r invalid sidecar: %s", company_name, exc)
+            return _error(400, str(exc))
+
     upload_dir = Path(current_app.config["UPLOAD_DIR"])
     db = get_db()
+    # Serialize publication/name allocation, including sanitization collisions.
+    _lock_upload(db)
     previous = find_video(db, company_name)
     filename = _storage_filename(db, upload_dir, company_name, extension)
     target = upload_dir / filename
-
-    # Write to a temporary file first so a broken upload never replaces a good video.
+    video_url = request.host_url + "media/" + quote(filename)
+    job_id = str(uuid.uuid4()) if metadata is not None else None
+    snapshot = upload_dir / ".jobs" / job_id if job_id else None
     temp_path = upload_dir / f".{uuid.uuid4().hex}.part"
+    backup = upload_dir / f".{uuid.uuid4().hex}.backup"
+    published = False
     try:
         file.save(str(temp_path))
-        os.replace(str(temp_path), str(target))
+        if snapshot:
+            snapshot.mkdir(parents=True)
+            source_path = snapshot / ("input" + extension)
+            sidecar_path = Path(str(source_path) + ".zoom.json")
+            shutil.copyfile(temp_path, source_path)
+            sidecar_path.write_text(json.dumps(metadata), encoding="utf-8")
+            _insert_job(db, job_id, company_name, video_url, source_path, sidecar_path)
+            logger.debug("snapshot job=%s source=%s", job_id, source_path)
+        upsert_video(db, company_name, str(target), video_url, commit=False)
+        if target.exists():
+            shutil.copyfile(target, backup)
+        os.replace(temp_path, target)
+        published = True
+        db.commit()
+    except Exception:
+        if published:
+            if backup.exists():
+                os.replace(backup, target)
+            else:
+                target.unlink(missing_ok=True)
+        db.rollback()
+        if snapshot and snapshot.exists():
+            shutil.rmtree(snapshot)
+        logger.exception("upload publication failed company=%r job=%s", company_name, job_id)
+        raise
     finally:
-        if temp_path.exists():
-            temp_path.unlink()
-
-    video_url = request.host_url + "media/" + quote(filename)
-    upsert_video(db, company_name, str(target), video_url)
+        temp_path.unlink(missing_ok=True)
+        backup.unlink(missing_ok=True)
     if previous is not None:
         _remove_stale_file(previous["file_path"], str(target), company_name)
 
@@ -371,7 +478,11 @@ def upload():
         "updated" if previous is not None else "created",
         company_name, filename, target.stat().st_size, video_url,
     )
-    return jsonify({"company_name": company_name, "video_url": video_url})
+    response = {"company_name": company_name, "video_url": video_url}
+    if job_id:
+        response["job_id"] = job_id
+        logger.info("job created id=%s company=%r", job_id, company_name)
+    return jsonify(response)
 
 
 def get_video_url():
@@ -391,7 +502,86 @@ def get_video_url():
 def media(filename):
     """Serve an uploaded video (path traversal is rejected by send_from_directory)."""
     logger.debug("media request %r", filename)
+    if any(part.startswith(".") for part in filename.replace("\\", "/").split("/")):
+        return _error(404, "file not found")
     return send_from_directory(current_app.config["UPLOAD_DIR"], filename, conditional=True)
+
+
+def _zoom_timeout():
+    value = _env_number("ZOOM_PROCESS_TIMEOUT", 300, float)
+    return value if math.isfinite(value) and value > 0 else 300
+
+
+def _find_job(db, job_id):
+    with db.cursor() as cursor:
+        cursor.execute("SELECT * FROM jobs WHERE id=%s", (str(job_id),))
+        return cursor.fetchone()
+
+
+def _expire_job(db, job_id):
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE jobs SET status='failed', error='processing interrupted or deadline expired', "
+            "updated_at=NOW() WHERE id=%s AND status='processing' AND deadline_at < NOW() "
+            "RETURNING id", (str(job_id),))
+        expired = cursor.fetchone()
+    db.commit()
+    if expired:
+        logger.warning("job expired id=%s", job_id)
+
+
+def _job_response(row):
+    return dict(id=str(row["id"]), company_name=row["company_name"], status=row["status"],
+                original_video_url=row["original_video_url"],
+                processed_video_url=row["processed_video_url"], error=row["error"])
+
+
+def job_status(job_id):
+    db = get_db()
+    _expire_job(db, job_id)
+    row = _find_job(db, job_id)
+    if row is None:
+        return _error(404, "job not found")
+    return jsonify(_job_response(row))
+
+
+def process_job(job_id):
+    """Synchronous, retryable processing: claim briefly, encode outside the transaction."""
+    db = get_db()
+    _expire_job(db, job_id)
+    attempt = str(uuid.uuid4())
+    timeout = _zoom_timeout()
+    row = _claim_job(db, job_id, attempt, timeout)
+    if row is None:
+        row = _find_job(db, job_id)
+        if row is None:
+            return _error(404, "job not found")
+        if row["status"] == "completed":
+            return jsonify(_job_response(row))
+        logger.warning("job already processing id=%s", job_id)
+        return _error(409, "job is already processing", job_id=str(job_id))
+
+    logger.info("job processing id=%s attempt=%s", job_id, attempt)
+    output = Path(current_app.config["UPLOAD_DIR"]) / f"{job_id}.{attempt}.zoomed.webm"
+    started = time.monotonic()
+    try:
+        process_video(row["source_path"], output=output, sidecar=row["sidecar_path"],
+                      ffmpeg=os.environ.get("FFMPEG_PATH", "ffmpeg"), timeout=timeout)
+        result_url = row["original_video_url"].rsplit("media/", 1)[0] + "media/" + output.name
+        completed = _complete_job(db, job_id, attempt, output, result_url)
+        if completed is None:
+            output.unlink(missing_ok=True)
+            return _error(409, "processing attempt expired; check job status", job_id=str(job_id))
+        logger.info("job completed id=%s attempt=%s elapsed=%.3fs", job_id, attempt, time.monotonic()-started)
+        return jsonify(_job_response(completed))
+    except (ZoomError, OSError, psycopg2.Error) as exc:
+        db.rollback()
+        output.unlink(missing_ok=True)
+        logger.exception("job failed id=%s attempt=%s: %s", job_id, attempt, exc)
+        # The API never exposes filesystem paths, DB details, or raw ffmpeg stderr.
+        message = "processing timed out" if "timed out" in str(exc) else "video processing failed; see server logs"
+        _fail_job(db, job_id, attempt, message)
+        return _error(504 if "timed out" in message else 500, message, job_id=str(job_id))
 
 
 def videos():
@@ -415,6 +605,8 @@ def index():
     return jsonify({
         "service": "video web service",
         "endpoints": [
+            "GET /jobs/<id>",
+            "POST /jobs/<id>/process",
             "POST /upload",
             "GET /get_video_url?company_name=<name>",
             "GET /media/<filename>",
@@ -463,6 +655,8 @@ def create_app(db_config=None, upload_dir=None, db_retries=None):
     ``db_retries`` overrides DB_CONNECT_RETRIES for the startup wait.
     """
     app = Flask(__name__)
+    logging.getLogger("apply_zoom").setLevel(
+        getattr(logging, os.environ.get("ZOOM_LOG_LEVEL", "INFO").upper(), logging.INFO))
     app.config["DB_CONFIG"] = dict(db_config or db_config_from_env())
     upload_dir = upload_dir or os.environ.get("UPLOAD_DIR") or DEFAULT_UPLOAD_DIR
     app.config["UPLOAD_DIR"] = str(Path(upload_dir).resolve())
@@ -478,6 +672,8 @@ def create_app(db_config=None, upload_dir=None, db_retries=None):
     app.add_url_rule("/get_video_url", "get_video_url", get_video_url, methods=["GET"])
     app.add_url_rule("/media/<path:filename>", "media", media, methods=["GET"])
     app.add_url_rule("/videos", "videos", videos, methods=["GET"])
+    app.add_url_rule("/jobs/<uuid:job_id>", "job_status", job_status, methods=["GET"])
+    app.add_url_rule("/jobs/<uuid:job_id>/process", "process_job", process_job, methods=["POST"])
     app.add_url_rule("/health", "health", health, methods=["GET"])
     for code in JSON_ERROR_CODES:
         app.register_error_handler(code, _handle_http_error)

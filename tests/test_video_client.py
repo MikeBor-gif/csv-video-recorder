@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
@@ -41,6 +42,43 @@ def _free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+class ZoomClientTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.video = Path(self.tmp.name) / "input.webm"
+        self.video.write_bytes(b"video")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def response(self, data, status=200):
+        result = Mock(status_code=status)
+        result.json.return_value = data
+        return result
+
+    def test_sidecar_upload_returns_processed_url(self):
+        Path(str(self.video) + ".zoom.json").write_text('{}')
+        uploaded = self.response(dict(video_url="http://host/media/input.webm", job_id="a-job"))
+        processed = self.response(dict(status="completed", processed_video_url="http://host/media/zoomed.webm"))
+        with patch("requests.post", side_effect=[uploaded, processed]) as post:
+            result = video_client.UploadVideo("http://host", str(self.video), "A")
+        self.assertEqual(result, "http://host/media/zoomed.webm")
+        self.assertIn("zoom", post.call_args_list[0].kwargs["files"])
+        self.assertEqual(post.call_args_list[1].args[0], "http://host/jobs/a-job/process")
+
+    def test_no_sidecar_does_not_start_job(self):
+        with patch("requests.post", return_value=self.response(dict(video_url="original"))) as post:
+            self.assertEqual(video_client.UploadVideo("http://host", str(self.video), "A"), "original")
+        self.assertEqual(post.call_count, 1)
+
+    def test_processing_timeout_identifies_recoverable_job(self):
+        import requests
+        uploaded = self.response(dict(video_url="original", job_id="a-job"))
+        with patch("requests.post", side_effect=[uploaded, requests.Timeout("read timeout")]):
+            with self.assertRaisesRegex(video_client.VideoClientError, "check GET /jobs/a-job"):
+                video_client.UploadVideo("http://host", str(self.video), "A")
 
 
 class VideoClientTestCase(unittest.TestCase):

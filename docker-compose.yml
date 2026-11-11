@@ -17,6 +17,10 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-video_pass}   # set a real one in .env (not committed)
       WEB_SERVICE_LOG_LEVEL: ${WEB_SERVICE_LOG_LEVEL:-INFO}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-512}
+      FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}
+      ZOOM_PROCESS_TIMEOUT: ${ZOOM_PROCESS_TIMEOUT:-300}
+      ZOOM_HTTP_TIMEOUT: ${ZOOM_HTTP_TIMEOUT:-600}
+      ZOOM_LOG_LEVEL: ${ZOOM_LOG_LEVEL:-INFO}
     depends_on:
       db:
         condition: service_healthy

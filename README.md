@@ -6,6 +6,22 @@ Python + Playwright (sync API, Chromium). Для каждой строки `inpu
 
 Веб-сервис на Flask (`web_service.py`) принимает видео, хранит файлы в `uploads/`, а название компании, путь и URL — в **PostgreSQL**. Сервис работает в Docker: **Apache + mod_wsgi** в контейнере `web`, **PostgreSQL 16** — в отдельном контейнере `db`; оба запускаются через **Docker Compose**. С опцией `--server` рекордер загружает каждое видео и открывает его в Chromium.
 
+## Camtasia-style zoom (Internship Task 2)
+
+F5 или `window.__zoomAt(x, y)` отмечают начало приближения и отдаления. События записываются в JSON рядом с видео; ffmpeg внутри `web` плавно применяет зум после загрузки и сохраняет URL результата в PostgreSQL.
+
+```bash
+docker compose up --build -d --wait
+python scripts/verify_zoom.py
+python capture_video.py input.csv --zoom-demo --server http://localhost:8000 --view-seconds 10
+```
+
+Проверка `verify_zoom.py` создаёт валидное тестовое видео внутри Docker, не требует PDF или эталонного ролика и завершается `ALL ZOOM CHECKS PASSED`. Запись с `input.csv` требует установленных Python-зависимостей, Chromium и доступных результатов DuckDuckGo.
+
+| Документация | Содержание |
+|---|---|
+| [Зум: запись, обработка и проверки](docs/zoom.md) | F5, hook, sidecar, CLI, jobs API, настройки и pytest |
+
 ## Docker: веб-сервис и база данных (Internship Task 1)
 
 ```text
@@ -135,6 +151,7 @@ python capture_video.py --server http://localhost:8000         # запись �
 | `csv_path` | `input.csv` | Входной CSV (позиционный аргумент) |
 | `--server URL` | — | Адрес веб-сервиса; без опции рекордер работает как раньше и не требует `requests` |
 | `--view-seconds N` | `10` | `> 0` — держать браузер N секунд; `0` — до нажатия Enter |
+| `--zoom-demo` | выключен | Вызвать программный hook до и после ввода запроса; без этой опции зум отмечается вручную через F5 |
 
 Ошибка загрузки или просмотра пишется в лог (`[ERROR] [<company>] upload failed: ...`), обработка остальных строк продолжается.
 

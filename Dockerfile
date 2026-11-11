@@ -5,18 +5,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    UPLOAD_DIR=/app/uploads
+    UPLOAD_DIR=/app/uploads \
+    ZOOM_HTTP_TIMEOUT=600
 
 # Apache, plus headers and a compiler to build mod_wsgi for this image's Python.
 # curl is used by the healthcheck and for `docker compose exec web curl http://localhost/`.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends apache2 apache2-dev gcc libc6-dev curl \
+    && apt-get install -y --no-install-recommends apache2 apache2-dev gcc libc6-dev curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install -r requirements.txt \
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install -r requirements-dev.txt \
     # LoadModule line for the mod_wsgi built against /usr/local/bin/python3.12
     && mod_wsgi-express module-config > /etc/apache2/mods-available/wsgi_express.load \
     && a2enmod wsgi_express \
@@ -34,7 +35,8 @@ RUN echo "ServerName localhost" > /etc/apache2/conf-available/servername.conf \
     && ln -sf /proc/self/fd/1 /var/log/apache2/access.log \
     && ln -sf /proc/self/fd/1 /var/log/apache2/other_vhosts_access.log
 
-COPY web_service.py web_service.wsgi video_client.py ./
+COPY web_service.py web_service.wsgi video_client.py pytest.ini ./
+COPY apply_zoom.py zoom_events.py qscript.py capture_video.py ./
 COPY tests ./tests
 
 # The named volume "uploads" copies this ownership when it is created.

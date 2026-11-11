@@ -10,6 +10,7 @@ The test database is TEST_DB_NAME (default: "<DB_NAME>_test"), so the real
 """
 
 import os
+import logging
 import unittest
 
 import psycopg2
@@ -21,6 +22,16 @@ SKIP_MESSAGE = ("PostgreSQL is not available ({}); run the tests inside the cont
                 "docker compose exec -T web python -m unittest discover -s tests -v")
 
 _database_ready = False
+logger = logging.getLogger(__name__)
+
+
+def _assert_test_database(config):
+    name = config.get("dbname", "")
+    application_name = os.environ.get("DB_NAME")
+    if not application_name or not name.strip() or name in {application_name, "postgres", "template0", "template1"}:
+        logger.error("[FIX:test-db] refusing unsafe test database %r", name)
+        raise RuntimeError("tests require a separate non-system database; check TEST_DB_NAME and DB_NAME")
+    logger.debug("[FIX:test-db] isolated test database validated: %s", name)
 
 
 def test_db_config() -> dict:
@@ -30,6 +41,7 @@ def test_db_config() -> dict:
     except RuntimeError as exc:
         raise unittest.SkipTest(SKIP_MESSAGE.format(exc))
     config["dbname"] = os.environ.get("TEST_DB_NAME") or f"{config['dbname']}_test"
+    _assert_test_database(config)
     _ensure_database(config)
     return config
 
@@ -56,9 +68,11 @@ def _ensure_database(config):
 
 def reset_videos_table(config):
     """Drop the table so every test starts from an empty database."""
+    _assert_test_database(config)
     connection = psycopg2.connect(**config)
     try:
         with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS jobs")
             cursor.execute("DROP TABLE IF EXISTS videos")
         connection.commit()
     finally:
