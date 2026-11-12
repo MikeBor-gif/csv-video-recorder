@@ -15,6 +15,21 @@ def event(t, kind="in", x=640, y=360):
     return dict(t=t, type=kind, x=x, y=y)
 
 
+@pytest.mark.parametrize("factor", [10.01, 20])
+def test_factor_above_zoompan_limit_is_rejected(factor):
+    data = metadata()
+    data["zoom_factor"] = factor
+    with pytest.raises(ZoomError, match="zoom_factor"):
+        parse_sidecar(data)
+
+
+@pytest.mark.parametrize("factor", [1, 2, 10])
+def test_supported_factor_boundaries(factor):
+    data = metadata()
+    data["zoom_factor"] = factor
+    assert parse_sidecar(data)["zoom_factor"] == factor
+
+
 def test_frames_and_easing():
     m = metadata([event(1), event(4, "out")])
     assert ramp_frames(.5, 25) == 13

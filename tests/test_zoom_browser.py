@@ -21,7 +21,11 @@ pytestmark = pytest.mark.browser
 def local_site():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.startswith("/results"):
+            if self.path.startswith("/outer-frame"):
+                content = f'<iframe style="position:absolute;left:40px;top:30px;width:500px;height:350px;border:3px solid" src="http://127.0.0.1:{self.server.server_port}/inner-frame"></iframe>'
+            elif self.path.startswith("/inner-frame"):
+                content = '<input id="field" style="position:absolute;left:20px;top:20px">'
+            elif self.path.startswith("/results"):
                 content = f'<a data-testid="result-title-a" href="http://localhost:{self.server.server_port}/target">Result</a>'
             else:
                 content = '<h1>Zoom test</h1><form action="/results"><textarea name="q"></textarea><button type="submit">Search</button></form>'
@@ -92,6 +96,44 @@ def test_f5_hook_navigation_and_repeat(browser, local_site, tmp_path):
         page.evaluate("() => window.__zoomFlush()")
         assert [e["type"] for e in capture.events] == ["in", "out", "in"]
         assert (capture.events[-1]["x"], capture.events[-1]["y"]) == (123, 234)
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize("scale", [1, .75])
+def test_nested_cross_origin_frame_f5_and_hook(browser, local_site, tmp_path, scale):
+    context, page, capture = install(browser, tmp_path)
+    try:
+        page.goto(f"http://127.0.0.1:{local_site}/first")
+        page.evaluate(f'''() => {{
+          document.body.innerHTML = '<iframe style="position:absolute;left:200px;top:100px;width:600px;height:500px;border:2px solid;transform-origin:0 0;transform:scale({scale})" src="http://localhost:{local_site}/outer-frame"></iframe>';
+        }}''')
+        field = page.frame_locator("iframe").frame_locator("iframe").locator("#field")
+        field.click(position={"x": 10, "y": 10})
+        box = field.bounding_box()
+        page.mouse.move(box["x"] + 10, box["y"] + 10)
+        frame = page.frames[-1]
+        frame.evaluate("window.sentinel = 42")
+        page.keyboard.down("F5")
+        page.keyboard.down("F5")
+        page.keyboard.up("F5")
+        frame.evaluate("() => window.__zoomFlush()")
+        assert len(capture.events) == 1
+        # Chromium rounds mouse client coordinates in scaled child documents.
+        assert capture.events[0]["x"] == pytest.approx(box["x"] + 10, abs=1)
+        assert capture.events[0]["y"] == pytest.approx(box["y"] + 10, abs=1)
+        assert frame.evaluate("window.sentinel") == 42
+        assert page.locator('[data-zoom-indicator="in"]').count() == 1
+        accepted = frame.evaluate("() => window.__zoomAt(50,60)")
+        assert accepted["type"] == "out"
+        assert (accepted["x"], accepted["y"]) == (200 + 95*scale, 100 + 95*scale)
+        with pytest.raises(Error, match="invalid mouse coordinate"):
+            frame.evaluate("() => window.__zoomAt(NaN,60)")
+        # Focus stays in the frame while the cursor returns to the main document.
+        page.mouse.move(20, 30)
+        page.keyboard.press("F5")
+        frame.evaluate("() => window.__zoomFlush()")
+        assert (capture.events[-1]["x"], capture.events[-1]["y"]) == (20, 30)
     finally:
         context.close()
 

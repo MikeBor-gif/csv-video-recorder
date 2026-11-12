@@ -47,6 +47,8 @@ def parse_sidecar(data):
     fps = _number(data.get("fps"), "fps")
     ramp = _number(data.get("ramp_sec"), "ramp_sec")
     factor = _number(data.get("zoom_factor"), "zoom_factor", 1)
+    if factor > 10:
+        raise ZoomError("zoom_factor must be between 1 and 10 (ffmpeg zoompan limit)")
     if not fps or not ramp:
         raise ZoomError("fps and ramp_sec must be positive")
     _number(fps * ramp, "ramp frame count")

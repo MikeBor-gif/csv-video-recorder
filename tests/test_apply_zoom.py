@@ -144,3 +144,17 @@ def test_many_zoom_pairs_fit_windows_process_limit(tmp_path):
         output = process_video(video)
     assert Path(output).read_bytes() == b"encoded"
     assert not list(tmp_path.glob(".*")), "processing must clean up temporary filter files"
+
+
+@pytest.mark.parametrize("suffix", [".mp4", ".mov", ".ogg"])
+@pytest.mark.parametrize("with_sidecar", [False, True])
+def test_non_webm_cannot_be_copied_as_webm(tmp_path, suffix, with_sidecar):
+    video = tmp_path / ("input" + suffix)
+    video.write_bytes(b"original")
+    if with_sidecar:
+        video.with_name(video.name + ".zoom.json").write_text(json.dumps(metadata()), encoding="utf-8")
+    with patch("apply_zoom.subprocess.run") as run:
+        with pytest.raises(ZoomError, match="WebM"):
+            process_video(video)
+        run.assert_not_called()
+    assert not (tmp_path / "input.zoomed.webm").exists()

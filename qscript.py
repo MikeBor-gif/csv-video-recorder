@@ -64,9 +64,76 @@ _active_page = None
 # All zoom state lives in a per-recording collector, not in this injected document.
 ZOOM_JS = r"""
 (() => {
-  if (window !== window.top) return;
   let point = {x: 0, y: 0};
   let mouseMoved = false;
+  const child = window !== window.top;
+  const channel = '__qsZoomFrameV1';
+  let acceptPayload;
+  const position = payload => {
+    mouseMoved = true;
+    point = {x:payload.x,y:payload.y};
+    if (!child) window.__qsZoomEvent({action:'position',...point}).catch(console.error);
+  };
+  // Each parent maps only its direct child's viewport to its own viewport.
+  // postMessage also works for cross-origin and nested frames.
+  window.addEventListener('message', e => {
+    const data = e.data;
+    if (!data || data.channel !== channel) return;
+    const frame = [...document.querySelectorAll('iframe,frame')]
+      .find(frame => frame.contentWindow === e.source);
+    if (!frame || !['position','toggle'].includes(data.action)
+        || !Number.isFinite(data.x) || !Number.isFinite(data.y)) return;
+    const rect = frame.getBoundingClientRect();
+    const sx = frame.offsetWidth ? rect.width / frame.offsetWidth : 1;
+    const sy = frame.offsetHeight ? rect.height / frame.offsetHeight : 1;
+    const payload = {...data,
+      x:rect.left + (frame.clientLeft + data.x)*sx,
+      y:rect.top + (frame.clientTop + data.y)*sy};
+    if (payload.action === 'position') position(payload);
+    if (child) {
+      window.parent.postMessage(payload, '*', [...e.ports]);
+    } else if (payload.action === 'toggle') {
+      const port = e.ports[0];
+      if (payload.atCursor) Object.assign(payload, point);
+      acceptPayload(payload).then(event => {
+        if (port) {port.postMessage({event}); port.close();}
+      }, error => {
+        if (port) {port.postMessage({error:String(error)}); port.close();}
+      });
+    }
+  });
+  if (child) {
+    let pending = Promise.resolve();
+    window.__zoomReady = pending;
+    window.addEventListener('mousemove', e => {
+      position({x:e.clientX,y:e.clientY});
+      window.parent.postMessage({channel,action:'position',...point}, '*');
+    }, true);
+    const toggle = (x,y,atCursor=false) => {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return Promise.reject(new Error('invalid mouse coordinate'));
+      }
+      const payload = {channel,action:'toggle',x,y,atCursor,epoch:performance.timeOrigin+performance.now()};
+      const accepted = pending.then(() => new Promise((resolve,reject) => {
+        const reply = new MessageChannel();
+        reply.port1.onmessage = e => {
+          reply.port1.close();
+          if (e.data.error) reject(new Error(e.data.error)); else resolve(e.data.event);
+        };
+        window.parent.postMessage(payload, '*', [reply.port2]);
+      }));
+      pending = accepted.catch(() => {});
+      return accepted;
+    };
+    window.__zoomAt = (x,y) => toggle(x,y);
+    window.__zoomFlush = () => pending;
+    window.addEventListener('keydown', e => {
+      if (e.key !== 'F5') return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (!e.repeat) toggle(point.x,point.y,true).catch(console.error);
+    }, true);
+    return;
+  }
   let pending = window.__qsZoomEvent({action: 'state'}).then(state => {
     // A bootstrap reply is a snapshot; a newer mousemove must win.
     if (!mouseMoved) point = {x: state.x, y: state.y};
@@ -74,9 +141,7 @@ ZOOM_JS = r"""
   });
   window.__zoomReady = pending;
   window.addEventListener('mousemove', e => {
-    mouseMoved = true;
-    point = {x:e.clientX,y:e.clientY};
-    window.__qsZoomEvent({action:'position',...point}).catch(console.error);
+    position({x:e.clientX,y:e.clientY});
   }, true);
   const ring = (event) => {
     if (!document.documentElement) return;
@@ -90,14 +155,14 @@ ZOOM_JS = r"""
     setTimeout(() => {el.style.opacity='0';},100);
     setTimeout(() => el.remove(),600);
   };
-  window.__zoomAt = (x,y) => {
-    const payload = {action:'toggle',x,y,epoch:performance.timeOrigin+performance.now()};
+  acceptPayload = payload => {
     const accepted = pending.then(() => window.__qsZoomEvent(payload)).then(event => {
       ring(event); return event;
     });
     pending = accepted.catch(() => {});
     return accepted;
   };
+  window.__zoomAt = (x,y) => acceptPayload({action:'toggle',x,y,epoch:performance.timeOrigin+performance.now()});
   window.__zoomFlush = () => pending;
   window.addEventListener('keydown', e => {
     if (e.key !== 'F5') return;
@@ -142,6 +207,8 @@ class _ZoomCapture:
                      y=payload.get("y"), type="in" if len(self.events) % 2 == 0 else "out")
         data = self.metadata(self.events + [event])
         self.events = data["events"]
+        if payload.get("channel") == "__qsZoomFrameV1":
+            _log("zoom", f"[FIX:iframe-zoom] mapped frame event {self.events[-1]}", "DEBUG")
         _log("zoom", f"accepted {self.events[-1]}", "DEBUG")
         return self.events[-1]
 

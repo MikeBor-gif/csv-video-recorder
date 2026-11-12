@@ -419,6 +419,9 @@ def upload():
                       allowed=sorted(ALLOWED_EXTENSIONS))
 
     zoom_file = request.files.get("zoom")
+    if zoom_file is not None and extension != ".webm":
+        logger.warning("[FIX:zoom-format] rejected zoom upload extension=%r", extension)
+        return _error(400, "zoom processing requires a WebM input (.webm)")
     metadata = None
     if zoom_file is not None:
         try:

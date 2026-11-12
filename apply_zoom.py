@@ -115,6 +115,9 @@ def process_video(video, output=None, sidecar=None, ffmpeg="ffmpeg", timeout=300
     sidecar = Path(sidecar) if sidecar is not None else Path(str(video) + ".zoom.json")
     if not video.is_file():
         raise ZoomError(f"video not found: {video}")
+    if video.suffix.lower() != ".webm":
+        logger.warning("[FIX:zoom-format] rejected non-WebM input: %s", video)
+        raise ZoomError("zoom processing requires a WebM input (.webm)")
     if output == video or (output.exists() and os.path.samefile(video, output)):
         raise ZoomError("input and output must differ")
     if output.suffix.lower() != ".webm":

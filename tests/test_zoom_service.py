@@ -21,8 +21,8 @@ def service(tmp_path):
     return app, app.test_client(), config
 
 
-def upload(client, events=None, content=b"original", company="Zoom AG", raw=None):
-    data = dict(company_name=company, file=(io.BytesIO(content), "input.webm"))
+def upload(client, events=None, content=b"original", company="Zoom AG", raw=None, filename="input.webm"):
+    data = dict(company_name=company, file=(io.BytesIO(content), filename))
     if events is not None or raw is not None:
         data["zoom"] = (io.BytesIO(raw if raw is not None else json.dumps(metadata(events)).encode()), "events.json")
     return client.post("/upload", data=data, content_type="multipart/form-data")
@@ -52,6 +52,27 @@ def test_bad_sidecar_preserves_previous_upload(service):
 def test_plain_upload_keeps_old_contract(service):
     _, client, _ = service
     assert set(upload(client).json) == {"company_name", "video_url"}
+
+
+@pytest.mark.parametrize("filename", ["input.mp4", "input.mov", "input.ogg"])
+def test_zoom_rejects_non_webm_but_plain_upload_still_works(service, filename):
+    _, client, config = service
+    first = upload(client, filename=filename)
+    assert first.status_code == 200
+    rejected = upload(client, events=[], content=b"bad", filename=filename)
+    assert rejected.status_code == 400
+    assert client.get(first.json["video_url"]).data == b"original"
+    assert pg_helpers.query(config, "SELECT count(*) FROM jobs")[0][0] == 0
+
+
+def test_excessive_factor_preserves_previous_upload(service):
+    _, client, config = service
+    first = upload(client)
+    data = metadata([event(0)])
+    data["zoom_factor"] = 20
+    assert upload(client, raw=json.dumps(data).encode(), content=b"bad").status_code == 400
+    assert client.get(first.json["video_url"]).data == b"original"
+    assert pg_helpers.query(config, "SELECT count(*) FROM jobs")[0][0] == 0
 
 
 def fake_process(video, output, **kwargs):
