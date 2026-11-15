@@ -16,3 +16,19 @@ videos.db-shm
 
 # Docker Compose secrets
 .env
+
+# Local development tools
+.pytest_cache/
+.agents/
+.claude/
+.codex/
+.ai-factory/
+.ai-factory.json
+.mcp.json
+AGENTS.md
+skills-lock.json
+
+# Task materials and reference recordings
+/INTERNSHIP_TASK_*.pdf
+/TEST_TASK*.pdf
+/output.webm
