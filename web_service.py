@@ -79,6 +79,10 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+_UUID_FILENAME_PART = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_JOB_RESULT_FILENAME = re.compile(
+    rf"{_UUID_FILENAME_PART}\.{_UUID_FILENAME_PART}\.zoomed\.webm", re.IGNORECASE)
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS videos (
     id           SERIAL      PRIMARY KEY,
@@ -363,15 +367,23 @@ def _storage_filename(db, upload_dir, company_name, extension):
     "ACME GmbH" -> "ACME_GmbH.webm"; names that sanitise to nothing (e.g. Cyrillic)
     or collide with another company's file get a short hash of the name appended.
     """
-    base = _safe_name(company_name)
-    if not base:
-        return f"video_{_name_hash(company_name)}{extension}"
+    base = _safe_name(company_name) or f"video_{_name_hash(company_name)}"
     filename = f"{base}{extension}"
-    owner = _owner_of_file(db, str(Path(upload_dir) / filename))
-    if owner is not None and owner != company_name:
-        logger.debug("file name %r is taken by %r; adding hash", filename, owner)
-        filename = f"{base}_{_name_hash(company_name)}{extension}"
-    return filename
+    if _JOB_RESULT_FILENAME.fullmatch(filename):
+        # Reserve even unpublished attempts: processing writes outside the upload lock.
+        logger.debug("[FIX:result-names] reserving result filename=%r company=%r", filename, company_name)
+        base = f"upload_{base}"
+        filename = f"{base}{extension}"
+    attempt = 0
+    while True:
+        owner = _owner_of_file(db, str(Path(upload_dir) / filename))
+        if owner is None or owner == company_name:
+            logger.debug("[FIX:result-names] allocated company=%r filename=%r", company_name, filename)
+            return filename
+        logger.debug("[FIX:result-names] filename=%r owned by=%r; trying fallback", filename, owner)
+        attempt += 1
+        suffix = "" if attempt == 1 else f"_{attempt}"
+        filename = f"{base}_{_name_hash(company_name)}{suffix}{extension}"
 
 
 def _upload_extension(filename):
@@ -388,6 +400,11 @@ def _error(status, message, **extra):
 def _remove_stale_file(old_path, new_path, company_name):
     """Delete the previous file of a company when its new upload got another name."""
     if not old_path or old_path == new_path or not os.path.isfile(old_path):
+        return
+    if _JOB_RESULT_FILENAME.fullmatch(Path(old_path).name):
+        # Legacy videos rows may point at results overwritten before names were reserved.
+        logger.warning("[FIX:result-names] preserving job result during upload cleanup company=%r path=%s",
+                       company_name, old_path)
         return
     try:
         os.remove(old_path)
@@ -468,7 +485,8 @@ def upload():
         db.rollback()
         if snapshot and snapshot.exists():
             shutil.rmtree(snapshot)
-        logger.exception("upload publication failed company=%r job=%s", company_name, job_id)
+        logger.exception("[FIX:result-names] upload publication failed company=%r job=%s filename=%r",
+                         company_name, job_id, filename)
         raise
     finally:
         temp_path.unlink(missing_ok=True)

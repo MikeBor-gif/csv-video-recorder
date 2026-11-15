@@ -54,6 +54,67 @@ def test_plain_upload_keeps_old_contract(service):
     assert set(upload(client).json) == {"company_name", "video_url"}
 
 
+@pytest.mark.parametrize("events", [None, []])
+def test_upload_cannot_overwrite_completed_job_result(service, events):
+    _, client, _ = service
+    job = upload(client, events=[]).json["job_id"]
+    completed = client.post(f"/jobs/{job}/process")
+    assert completed.status_code == 200
+    result_url = completed.json["processed_video_url"]
+    company = result_url.rsplit("/", 1)[-1].removesuffix(".webm")
+
+    replacement = upload(client, events=events, company=company, content=b"replacement")
+    assert replacement.status_code == 200
+    assert client.get(result_url).data == b"original"
+    assert client.get(replacement.json["video_url"]).data == b"replacement"
+    assert client.post(f"/jobs/{job}/process").json == completed.json
+
+    # Changing the upload's extension must not delete another job's result as stale.
+    assert upload(client, company=company, filename="new.mp4").status_code == 200
+    assert client.get(result_url).data == b"original"
+
+
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_upload_reserves_result_filename_before_job_publication(service, uppercase):
+    _, client, _ = service
+    filename = f"{uuid.uuid4()}.{uuid.uuid4()}.zoomed.webm"
+    if uppercase:
+        filename = filename.upper()
+    response = upload(client, company=filename[:-5])
+    assert response.status_code == 200
+    assert response.json["video_url"].rsplit("/", 1)[-1].lower() != filename.lower()
+    assert client.get(response.json["video_url"]).data == b"original"
+
+
+def test_reupload_preserves_result_referenced_by_legacy_video_record(service):
+    app, client, config = service
+    job = upload(client, events=[]).json["job_id"]
+    result_url = client.post(f"/jobs/{job}/process").json["processed_video_url"]
+    filename = result_url.rsplit("/", 1)[-1]
+    company = filename[:-5]
+    # A pre-fix upload may have left a videos record pointing at a jobs result.
+    with app.app_context():
+        web_service.upsert_video(web_service.get_db(), company,
+                                 str(Path(app.config["UPLOAD_DIR"]) / filename), result_url)
+    response = upload(client, company=company, filename="replacement.mp4", content=b"new")
+    assert response.status_code == 200
+    assert client.get(response.json["video_url"]).data == b"new"
+    assert client.get(result_url).data == b"original"
+
+
+def test_upload_checks_ownership_of_fallback_filename(service):
+    _, client, _ = service
+    first = upload(client, company="A B", content=b"first")
+    collision_company = "A/B"
+    fallback_company = "A_B_" + web_service._name_hash(collision_company)
+    reserved = upload(client, company=fallback_company, content=b"reserved")
+    collision = upload(client, company=collision_company, content=b"collision")
+    assert collision.status_code == 200
+    assert client.get(first.json["video_url"]).data == b"first"
+    assert client.get(reserved.json["video_url"]).data == b"reserved"
+    assert client.get(collision.json["video_url"]).data == b"collision"
+
+
 @pytest.mark.parametrize("filename", ["input.mp4", "input.mov", "input.ogg"])
 def test_zoom_rejects_non_webm_but_plain_upload_still_works(service, filename):
     _, client, config = service
