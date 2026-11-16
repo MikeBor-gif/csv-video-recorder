@@ -4,18 +4,67 @@
 
 Task 3 расширяет существующий Flask-сервис. CSV загружается через HTML-форму в PostgreSQL, отдельная CLI-программа находит Impressum/Imprint и извлекает юридические реквизиты через DeepSeek. Для импорта и чтения компаний API-ключ не требуется.
 
-## Запуск
+## Запуск с нового компьютера
 
-1. В локальном `.env` задайте `DEEPSEEK_API_KEY` и доступную `DEEPSEEK_MODEL`. Ключ не вставляйте в исходники, Dockerfile, CSV или команды; `.env` исключён из Git и Docker image. Пример настроек — [`.env.example`](../.env.example).
-2. Выполните `docker compose up -d --build --wait`.
-3. Откройте http://localhost:8000/upload_companies, выберите [companies.csv](../companies.csv) и нажмите Import. Ответ — JSON со счётчиками.
-4. Запустите обогащение:
+Нужны Git, запущенный Docker Desktop с Linux containers (Windows/macOS) либо Docker Engine с Compose v2 (Linux), свободный порт 8000 и доступ в интернет. Для этого Docker-пути устанавливать Python, pip, Chromium или ffmpeg на компьютер не нужно.
+
+### 1. Получите репозиторий и перейдите в его папку
+
+```bash
+git clone https://github.com/MikeBor-gif/csv-video-recorder.git
+cd csv-video-recorder
+```
+
+Если репозиторий уже клонирован, просто перейдите в его папку. Все следующие команды выполняйте оттуда, где находится `docker-compose.yml`; запуск из `C:\WINDOWS\system32` даст `no configuration file provided`.
+
+### 2. Создайте .env и укажите ключ
+
+В свежем клоне выполните одну из команд:
+
+```powershell
+# Windows PowerShell
+Copy-Item .env.example .env
+notepad .env
+```
+
+```bash
+# Linux / macOS: затем откройте .env любым текстовым редактором
+cp .env.example .env
+```
+
+Если `.env` уже существует, отредактируйте его вместо повторного копирования. В файле замените `your_deepseek_api_key` своим ключом и сохраните:
+
+```dotenv
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_MODEL=deepseek-flash
+```
+
+`deepseek-flash` — модель, с которой выполнены реальные проверки этого проекта; она явно выбрана в [`.env.example`](../.env.example). Кодовый default `deepseek-chat` сохранён по PDF для запуска без настройки модели. Ключ не вставляйте в исходники, Dockerfile, CSV или команды; `.env` исключён из Git и Docker image. Без ключа доступны запуск, импорт и автоматические тесты, но не реальное извлечение через DeepSeek.
+
+### 3. Запустите сервис
+
+```bash
+docker compose up -d --build --wait
+docker compose ps
+```
+
+У `web` и `db` должно быть состояние `healthy`. При первой сборке Docker скачивает и устанавливает зависимости, поэтому она может занять несколько минут.
+
+### 4. Импортируйте sample CSV
+
+Откройте http://localhost:8000/upload_companies, выберите [companies.csv](../companies.csv) из папки проекта и нажмите Import. В новой БД ожидается `{"imported":2,"updated":0,"total_rows":2}`, при повторе — `{"imported":0,"updated":2,"total_rows":2}`. На http://localhost:8000/companies новые записи имеют `status: null`.
+
+### 5. Выполните извлечение и проверьте результат
+
+Эта команда использует платный DeepSeek API — до двух попыток на компанию:
 
 ```bash
 docker compose exec -T web python enrich_companies.py --limit 2
 ```
 
-Результат доступен на http://localhost:8000/companies. Байты видео и существующие API видео/зумов не меняются.
+Откройте или обновите http://localhost:8000/companies. Для успешно обработанной компании в логе будет `status=0 (OK)`, а в JSON — `status: 0`, `impressum_url`, `legal_name`, `postal_address` и `raw_json`. Компоненты извлечённого адреса находятся в `raw_json.postal_address`; исходные `city`, `street` и другие CSV-поля могут оставаться пустыми, как в sample.
+
+После успеха повторный default-запуск пропускает эти компании без обращения к API. Если других незавершённых компаний нет, ожидается `selected=0`. Статусы 1–5 и диагностика описаны ниже. Для проверки без платных запросов используйте следующий раздел «Проверка и наблюдаемый результат». Байты видео и существующие API видео/зумов не меняются.
 
 ## CSV и повторный импорт
 
@@ -112,7 +161,7 @@ NUL, некорректный Unicode, неконечные числа (NaN/Infi
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `DEEPSEEK_API_KEY` | пусто | Обязательна перед необходимым API-вызовом; web/CSV работают без неё |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | Default по PDF; доступность модели проверяйте перед live-запуском |
+| `DEEPSEEK_MODEL` | `deepseek-chat` в коде/Compose; `deepseek-flash` в `.env.example` | Скопированный шаблон явно задаёт проверенную модель flash |
 | `ENRICH_LOG_LEVEL` | `DEBUG` | DEBUG/INFO/WARNING/ERROR для CLI |
 | `WEB_SERVICE_LOG_LEVEL` | `INFO` | Логи Flask/импорта |
 | `DB_*` | окружение Task 1 | Общая PostgreSQL |
@@ -121,15 +170,28 @@ NUL, некорректный Unicode, неконечные числа (NaN/Infi
 
 ## Проверка и наблюдаемый результат
 
-Автоматические тесты используют подставные HTTP/API-ответы без реального ключа. DB-тесты используют защищённую отдельную `<DB_NAME>_test`:
+После старта контейнеров выполните эти команды в папке проекта. Они не вызывают платный DeepSeek API и не требуют локальных Python/pip:
 
 ```bash
+docker compose exec -T web python scripts/verify_companies.py --server http://127.0.0.1
+docker compose exec -T web python -m pytest tests -m "not browser" -q
+```
+
+Ожидаемые итоги текущей версии: `ALL COMPANY CHECKS PASSED` и `218 passed, 6 deselected`. Шесть browser-тестов исключены выбранным фильтром и здесь не проверяются. Внутри `web` Apache доступен на порту 80, поэтому `--server` указан без `:8000`; в браузере на компьютере используется http://localhost:8000.
+
+Первая команда импортирует sample и проверяет идемпотентность/сохранность извлечения; рабочую БД не очищает. Автоматические тесты используют подставные HTTP/API-ответы без реального ключа. DB-тесты работают в защищённой отдельной `<DB_NAME>_test`.
+
+### Необязательный запуск проверок на компьютере
+
+Этот путь требует Python 3.9+ и активированного окружения из [README](../README.md#рекордер); на Linux также нужны указанные там build-зависимости mod_wsgi. Сначала установите dev-зависимости:
+
+```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest tests/test_impressum.py tests/test_deepseek_extraction.py -v
-docker compose exec -T web python -m pytest tests -m "not browser" -v
 python scripts/verify_companies.py --server http://127.0.0.1:8000
 ```
 
-Последняя команда импортирует sample и проверяет идемпотентность/сохранность извлечения; рабочую БД не очищает. Для явной платной проверки используйте `--live`: она обрабатывает только две sample-компании без принудительного повтора OK, максимум 4 API-попытки. При ненулевом exit CLI проверка останавливается с ошибкой, даже если в БД остались прежние успешные результаты. Не запускайте её автоматически после сбоя. При системном прокси добавьте `localhost,127.0.0.1` в `NO_PROXY`.
+При системном прокси добавьте `localhost,127.0.0.1` в `NO_PROXY`. Для явной платной проверки с компьютера у `verify_companies.py` есть `--live`: он обрабатывает только две sample-компании без принудительного повтора OK, максимум 4 API-попытки. При ненулевом exit CLI проверка останавливается с ошибкой, даже если в БД остались прежние успешные результаты. Не запускайте её автоматически после сбоя. Docker-путь для платного извлечения — команда `enrich_companies.py` из шага 5 выше.
 
 Приёмка 2026-11-16 через настоящую форму Chromium, Apache, PostgreSQL и DeepSeek:
 
