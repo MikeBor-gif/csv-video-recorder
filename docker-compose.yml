@@ -21,6 +21,9 @@ services:
       ZOOM_PROCESS_TIMEOUT: ${ZOOM_PROCESS_TIMEOUT:-300}
       ZOOM_HTTP_TIMEOUT: ${ZOOM_HTTP_TIMEOUT:-600}
       ZOOM_LOG_LEVEL: ${ZOOM_LOG_LEVEL:-INFO}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      ENRICH_LOG_LEVEL: ${ENRICH_LOG_LEVEL:-DEBUG}
     depends_on:
       db:
         condition: service_healthy

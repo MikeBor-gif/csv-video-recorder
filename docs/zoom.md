@@ -1,4 +1,4 @@
-[К README](../README.md)
+[К README](../README.md) · [Компании и Impressum →](companies.md)
 
 # Зум и API
 

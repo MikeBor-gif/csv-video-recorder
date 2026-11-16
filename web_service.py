@@ -45,10 +45,11 @@ from urllib.parse import quote
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from flask import Flask, current_app, g, jsonify, request, send_from_directory
+from flask import Flask, current_app, g, jsonify, request, send_from_directory, render_template_string
 
 from zoom_events import ZoomError, parse_sidecar
 from apply_zoom import process_video
+import company_data
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -212,6 +213,7 @@ def init_db(config, retries=None):
     try:
         with connection.cursor() as cursor:
             cursor.execute(SCHEMA_SQL)
+        company_data.init_companies(connection)
         connection.commit()
     finally:
         connection.close()
@@ -622,10 +624,62 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def upload_companies():
+    if request.method == "GET":
+        return render_template_string("""<!doctype html><html lang="en"><meta charset="utf-8">
+<title>Import companies</title><h1>Import companies CSV</h1>
+<form method="post" action="/upload_companies" enctype="multipart/form-data">
+<label>UTF-8 CSV <input type="file" name="file" accept=".csv" required></label>
+<button type="submit">Import</button></form><p><a href="/companies">Companies JSON</a></p></html>""")
+    files = request.files.getlist("file")
+    if len(files) != 1 or len(request.files) != 1 or not files[0].filename:
+        return _error(400, "one CSV file in multipart field file is required")
+    try:
+        rows = company_data.parse_company_csv(files[0].read())
+    except company_data.CompanyCSVError as exc:
+        logger.warning("company CSV rejected: %s", exc)
+        return _error(400, str(exc))
+    db = get_db()
+    try:
+        counts = company_data.import_companies(db, rows)
+        db.commit()
+    except psycopg2.Error:
+        db.rollback()
+        logger.error("company CSV transaction rolled back")
+        return _error(500, "company import failed")
+    logger.info("company CSV committed imported=%d updated=%d total_rows=%d",
+                counts["imported"], counts["updated"], counts["total_rows"])
+    return jsonify(counts)
+
+
+def companies():
+    raw_status = request.args.get("status")
+    try:
+        status = company_data.CompanyStatus(int(raw_status)) if raw_status is not None else None
+    except ValueError:
+        return _error(400, "status must be an integer from 0 to 5")
+    rows = company_data.list_companies(get_db(), status=status)
+    logger.debug("companies response rows=%d filter=%s", len(rows), status)
+    return jsonify([company_data.serialize_company(row) for row in rows])
+
+
+def company(company_name):
+    logger.debug("[FIX:company-path] lookup name_length=%d slash=%s", len(company_name), "/" in company_name)
+    rows = company_data.list_companies(get_db(), company_name=company_name)
+    if not rows:
+        logger.debug("company lookup not found")
+        return _error(404, "company not found")
+    return jsonify(company_data.serialize_company(rows[0]))
+
+
 def index():
     return jsonify({
         "service": "video web service",
         "endpoints": [
+            "GET /upload_companies",
+            "POST /upload_companies",
+            "GET /companies",
+            "GET /companies/<company_name>",
             "GET /jobs/<id>",
             "POST /jobs/<id>/process",
             "POST /upload",
@@ -696,6 +750,9 @@ def create_app(db_config=None, upload_dir=None, db_retries=None):
     app.add_url_rule("/jobs/<uuid:job_id>", "job_status", job_status, methods=["GET"])
     app.add_url_rule("/jobs/<uuid:job_id>/process", "process_job", process_job, methods=["POST"])
     app.add_url_rule("/health", "health", health, methods=["GET"])
+    app.add_url_rule("/upload_companies", "upload_companies", upload_companies, methods=["GET", "POST"])
+    app.add_url_rule("/companies", "companies", companies, methods=["GET"])
+    app.add_url_rule("/companies/<path:company_name>", "company", company, methods=["GET"])
     for code in JSON_ERROR_CODES:
         app.register_error_handler(code, _handle_http_error)
 

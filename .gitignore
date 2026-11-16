@@ -19,6 +19,7 @@ videos.db-shm
 
 # Local development tools
 .pytest_cache/
+.playwright-mcp/
 .agents/
 .claude/
 .codex/

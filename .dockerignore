@@ -20,4 +20,5 @@ AGENTS.md
 README.md
 docker-compose.yml
 Dockerfile
-scripts/
+scripts/*
+!scripts/verify_companies.py

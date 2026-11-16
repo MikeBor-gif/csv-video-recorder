@@ -1,6 +1,6 @@
 # Browser Video Recorder
 
-Запись браузерного сценария по CSV с плавным зумом вокруг курсора и обработкой видео в Docker.
+Запись браузерного сценария с зумом, хранение видео и извлечение реквизитов компаний из Impressum.
 
 Рекордер на Python и Playwright открывает DuckDuckGo, вводит `Magento developer in <City>` и переходит к первому результату. Для каждой компании создаётся WebM 1280×720 с курсором, подсветкой кликов и текстовой плашкой.
 
@@ -66,6 +66,20 @@ URL;Company Name;Language;Country;Postcode;City;Street;HouseNo
 
 Готовый файл: `video/<Company Name>.webm`. Недопустимые символы имени заменяются; повторная запись той же компании заменяет прежнее видео.
 
+## Компании и Impressum (Task 3)
+
+Откройте http://localhost:8000/upload_companies и загрузите [companies.csv](companies.csv).
+Данные доступны на http://localhost:8000/companies. Повторный импорт сохраняет результаты извлечения.
+
+Для извлечения задайте `DEEPSEEK_API_KEY` в локальном `.env`, выберите доступную модель через `DEEPSEEK_MODEL` и примените окружение:
+
+```bash
+docker compose up -d
+docker compose exec -T web python enrich_companies.py --limit 2
+```
+
+Уже успешно обработанные компании пропускаются. За один запуск возможно до двух API-попыток на компанию; автоматические тесты ключ не используют. Формат CSV, статусы, API и экономия токенов описаны в [руководстве Task 3](docs/companies.md).
+
 ## Проверка
 
 Сквозная проверка зума создаёт тестовое видео, кодирует его в контейнере и проверяет URL, PostgreSQL, разрешение, длительность и копирование без событий:
@@ -100,5 +114,6 @@ python -m pytest tests/test_zoom_browser.py -v
 | Руководство | Содержание |
 |---|---|
 | [Зум и API](docs/zoom.md) | Sidecar, ffmpeg CLI, загрузка, jobs API и настройки |
+| [Компании и Impressum](docs/companies.md) | Импорт CSV, companies API, DeepSeek CLI, бюджет и проверки |
 
 Логи: `docker compose logs -f web`. Остановка с сохранением данных: `docker compose down`.

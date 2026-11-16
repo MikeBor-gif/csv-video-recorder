@@ -88,3 +88,15 @@ def query(config, sql_text, params=()):
             return cursor.fetchall()
     finally:
         connection.close()
+
+
+def reset_companies_table(config):
+    """Reset only company fixtures in the isolated test database."""
+    _assert_test_database(config)
+    connection = psycopg2.connect(**config)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS companies")
+        connection.commit()
+    finally:
+        connection.close()

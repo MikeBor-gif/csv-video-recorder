@@ -37,6 +37,8 @@ RUN echo "ServerName localhost" > /etc/apache2/conf-available/servername.conf \
 
 COPY web_service.py web_service.wsgi video_client.py pytest.ini ./
 COPY apply_zoom.py zoom_events.py qscript.py capture_video.py ./
+COPY company_data.py impressum.py enrich_companies.py companies.csv ./
+COPY scripts/verify_companies.py ./scripts/
 COPY tests ./tests
 
 # The named volume "uploads" copies this ownership when it is created.
