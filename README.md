@@ -2,6 +2,8 @@
 
 Запись браузерного сценария с зумом, хранение видео и извлечение реквизитов компаний из Impressum.
 
+Task 4: `python magento_cart_agent.py --urls urls.txt` — Browser-Use + DeepSeek исследуют магазин, проверяют Magento-корзину и сохраняют screenshot формы доставки. Нужен Python 3.11+; [установка и проверки](docs/cart-agent.md).
+
 Для проверки Task 3 начните с [запуска с нового компьютера](docs/companies.md#запуск-с-нового-компьютера). Эту часть можно запустить и проверить целиком через Docker, без локальных Python и Chromium.
 
 Рекордер на Python и Playwright открывает DuckDuckGo, вводит `Magento developer in <City>` и переходит к первому результату. Для каждой компании создаётся WebM 1280×720 с курсором, подсветкой кликов и текстовой плашкой.
@@ -132,5 +134,6 @@ python -m pytest tests/test_zoom_browser.py -v
 |---|---|
 | [Зум и API](docs/zoom.md) | Sidecar, ffmpeg CLI, загрузка, jobs API и настройки |
 | [Компании и Impressum](docs/companies.md) | Импорт CSV, companies API, DeepSeek CLI, бюджет и проверки |
+| [Агент корзины — Task 4](docs/cart-agent.md) | CDP, DeepSeek, checkout screenshots, настройки и проверки |
 
 Логи: `docker compose logs -f web`. Остановка с сохранением данных: `docker compose down`.

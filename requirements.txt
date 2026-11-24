@@ -1,6 +1,9 @@
 --prefer-binary
 # Task 2 test dependencies: python -m pip install -r requirements-dev.txt
 playwright>=1.51
+# Task 4 is standalone and requires Python 3.11+. Legacy tools keep Python 3.9.
+browser-use==1.0.6; python_version >= "3.11"
+python-dotenv==1.2.4; python_version >= "3.11"
 flask>=2.2
 requests>=2.28
 # Task 3 HTML parsing (compatible with Python 3.9).

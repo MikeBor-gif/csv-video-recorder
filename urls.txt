@@ -1,0 +1,7 @@
+# Task 4 sample sites; the agent discovers the actual platform at runtime.
+rupp-onlineshop.de
+samenfest.de
+schmuckshopping.de
+senso-care.de
+schoen-und-wieder.de
+semilac.de
