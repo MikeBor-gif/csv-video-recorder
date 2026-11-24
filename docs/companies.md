@@ -1,4 +1,4 @@
-[← Зум и API](zoom.md) · [К README](../README.md)
+[← Зум и API](zoom.md) · [К README](../README.md) · [Объяснение лабораторной →](LAB_EXPLANATION.md)
 
 # Компании и Impressum
 

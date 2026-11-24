@@ -134,6 +134,7 @@ python -m pytest tests/test_zoom_browser.py -v
 |---|---|
 | [Зум и API](docs/zoom.md) | Sidecar, ffmpeg CLI, загрузка, jobs API и настройки |
 | [Компании и Impressum](docs/companies.md) | Импорт CSV, companies API, DeepSeek CLI, бюджет и проверки |
+| [Подробное объяснение лабораторной](docs/LAB_EXPLANATION.md) | Методички, теория, разбор кода, запуск и подготовка к защите |
 | [Агент корзины — Task 4](docs/cart-agent.md) | CDP, DeepSeek, checkout screenshots, настройки и проверки |
 
 Логи: `docker compose logs -f web`. Остановка с сохранением данных: `docker compose down`.
